@@ -2,7 +2,6 @@
 import React, { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import Layout from './components/Layout';
 import StoryBar from './components/StoryBar';
-import { MOCK_ROOMS } from './constants';
 import { generateRoast } from './services/geminiService';
 import { auth, db, functions } from './services/firebaseClient';
 import { httpsCallable } from 'firebase/functions';
@@ -10,9 +9,13 @@ import { collection, doc, getDoc, getDocs, limit, query, where } from 'firebase/
 import {
   ensureProfile,
   getOrCreateChat,
+  createRoom,
   subscribeMessages,
   subscribeToUserChats,
   createMessage,
+  addMessageReaction,
+  setTyping,
+  subscribeTyping,
   logout,
   createInvite,
   listInvitesForUser,
@@ -194,6 +197,8 @@ const ContactInviteModal: React.FC<ContactInviteModalProps> = ({
   );
 };
 
+const REACTION_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🔥'];
+
 // Expanded emoji list with "sexy", party, and classic vibes
 const QUICK_EMOJIS = [
   "🔥", "😂", "💀", "🌶️", "🥃", "🙌", "💯", "🤡", 
@@ -247,10 +252,14 @@ const App: React.FC = () => {
   const [newContactPhone, setNewContactPhone] = useState('');
   
   // Dynamic Content State
-  const [rooms, setRooms] = useState<ActiveRoom[]>(MOCK_ROOMS);
+  const [rooms, setRooms] = useState<ActiveRoom[]>([]);
   const [isCreatingGroup, setIsCreatingGroup] = useState(false);
   const [newGroupName, setNewGroupName] = useState("");
   const [selectedMembers, setSelectedMembers] = useState<string[]>([]);
+  const [tribeMemberSearch, setTribeMemberSearch] = useState("");
+  const [tribeSearchedUsers, setTribeSearchedUsers] = useState<Array<{ id: string; displayName?: string; email?: string }>>([]);
+  const [tribeCreateLoading, setTribeCreateLoading] = useState(false);
+  const [tribeCreateError, setTribeCreateError] = useState<string | null>(null);
   
   // Call History State
   const [callHistory, setCallHistory] = useState<CallHistoryItem[]>([
@@ -267,6 +276,11 @@ const App: React.FC = () => {
   // Chat History State
   const [chatMessages, setChatMessages] = useState<Record<string, Message[]>>({});
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
+  const [replyToMessage, setReplyToMessage] = useState<Message | null>(null);
+  const [typingIndicators, setTypingIndicators] = useState<Array<{ userId: string; displayName?: string }>>([]);
+  const [messageContextMenu, setMessageContextMenu] = useState<{ msg: Message; x: number; y: number } | null>(null);
+  const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const typingUnsubRef = useRef<(() => void) | null>(null);
   
   // Call States
   const [isCalling, setIsCalling] = useState(false);
@@ -424,7 +438,7 @@ const App: React.FC = () => {
       return;
     }
     const unsubscribe = subscribeToUserChats(currentUserId, (chats) => {
-      setRecentChats(chats.filter((c) => !c.isRoom));
+      setRecentChats(chats);
     });
     return () => unsubscribe();
   }, [currentUserId]);
@@ -452,6 +466,22 @@ const App: React.FC = () => {
     }, 300);
     return () => clearTimeout(timer);
   }, [searchQuery, activeTab, currentUserId]);
+
+  useEffect(() => {
+    if (!isCreatingGroup || !tribeMemberSearch.trim() || !currentUserId) {
+      setTribeSearchedUsers([]);
+      return;
+    }
+    const timer = setTimeout(async () => {
+      try {
+        const results = await searchUsersByDisplayName(tribeMemberSearch, currentUserId);
+        setTribeSearchedUsers(results);
+      } catch {
+        setTribeSearchedUsers([]);
+      }
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [tribeMemberSearch, isCreatingGroup, currentUserId]);
 
   useEffect(() => {
     if (!appUser) return;
@@ -511,11 +541,27 @@ const App: React.FC = () => {
   // Filter Logic
   const filteredRooms = useMemo(() => {
     if (activeTab !== 'party') return rooms;
-    return rooms.filter(room => 
-      room.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      room.lastSender.toLowerCase().includes(searchQuery.toLowerCase())
+    const fromRecent = recentChats
+      .filter((c) => c.isRoom)
+      .map((c) => ({
+        id: c.$id,
+        name: c.name || 'Tribe',
+        membersCount: c.participantIds?.length || 0,
+        lastMessage: c.lastMessage || '',
+        lastSender: (c as any).lastSenderDisplayName || '',
+        isLive: false,
+        avatar: `https://picsum.photos/seed/${encodeURIComponent(c.name || c.$id)}/200`,
+      }));
+    const fromState = rooms.filter(
+      (r) => !recentChats.some((c) => c.$id === r.id)
     );
-  }, [searchQuery, activeTab, rooms]);
+    const combined = [...fromRecent, ...fromState];
+    return combined.filter(
+      (room) =>
+        room.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+        room.lastSender.toLowerCase().includes(searchQuery.toLowerCase())
+    );
+  }, [searchQuery, activeTab, rooms, recentChats]);
 
   const filteredCalls = useMemo(() => {
     if (activeTab !== 'hotline') return callHistory;
@@ -525,21 +571,34 @@ const App: React.FC = () => {
   }, [searchQuery, activeTab, callHistory]);
 
   const storyBarUsers = useMemo(() => {
-    const fromChats: User[] = recentChats.map((chat) => {
-      const otherId = chat.participantIds?.find((p) => p !== currentUserId) || chat.externalId || '';
-      const otherDisplayName = chat.participantData?.[otherId]?.displayName || chat.name || 'Unknown';
-      return {
-        id: otherId,
-        name: otherDisplayName.toUpperCase(),
-        avatar: `https://picsum.photos/seed/${encodeURIComponent(otherId)}/200`,
+    const fromDirectChats: User[] = recentChats
+      .filter((chat) => !chat.isRoom)
+      .map((chat) => {
+        const otherId = chat.participantIds?.find((p) => p !== currentUserId) || chat.externalId || '';
+        const otherDisplayName = chat.participantData?.[otherId]?.displayName || chat.name || 'Unknown';
+        return {
+          id: otherId,
+          name: otherDisplayName.toUpperCase(),
+          avatar: `https://picsum.photos/seed/${encodeURIComponent(otherId)}/200`,
+          status: 'online' as const,
+          onBakchod: true,
+          appUserId: otherId,
+        };
+      });
+    const fromRooms = recentChats
+      .filter((chat) => chat.isRoom)
+      .map((chat) => ({
+        id: chat.$id,
+        name: (chat.name || 'Tribe').toUpperCase(),
+        avatar: `https://picsum.photos/seed/${encodeURIComponent(chat.name || chat.$id)}/200`,
         status: 'online' as const,
         onBakchod: true,
-        appUserId: otherId,
-      };
-    });
-    const chatIds = new Set(fromChats.map((u) => u.id));
+        appUserId: chat.$id,
+        isRoom: true,
+      }));
+    const chatIds = new Set([...fromDirectChats.map((u) => u.id), ...fromRooms.map((u) => u.id)]);
     const fromContacts = contacts.filter((c) => !chatIds.has(c.id) && !chatIds.has(c.appUserId || ''));
-    return [...fromChats, ...fromContacts];
+    return [...fromDirectChats, ...fromRooms, ...fromContacts];
   }, [recentChats, contacts, currentUserId]);
 
   // AI Interaction
@@ -639,14 +698,14 @@ const App: React.FC = () => {
 
   const loadChatFromBackend = async (chatId: string, name: string, isRoom: boolean) => {
     if (!currentUserId) return;
-    const chatDoc = await getOrCreateChat({
+    const firestoreChatId = isRoom ? chatId : (await getOrCreateChat({
       userId: currentUserId,
       externalId: chatId,
       name,
       isRoom,
       currentUserDisplayName: displayName,
-    });
-    setChatDocIds(prev => ({ ...prev, [chatId]: chatDoc.$id }));
+    })).$id;
+    setChatDocIds(prev => ({ ...prev, [chatId]: firestoreChatId }));
 
     if (activeChatUnsubscribeRef.current) {
       activeChatUnsubscribeRef.current();
@@ -659,17 +718,36 @@ const App: React.FC = () => {
       if (typeof value?.seconds === "number") return new Date(value.seconds * 1000);
       return new Date(value);
     };
-    activeChatUnsubscribeRef.current = subscribeMessages(chatDoc.$id, (payload) => {
-      const mapped: Message[] = payload.documents.map((doc: any) => ({
-        id: doc.$id,
-        senderId: doc.senderId || doc.userId,
-        senderName: doc.role === 'bot' ? 'ECSTASY BOT' : displayName,
-        text: doc.content,
-        timestamp: toDate(doc.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        type: doc.type || 'text',
-        imageUrl: doc.imageUrl || undefined,
-      }));
+    let participantData: Record<string, { displayName?: string }> = {};
+    try {
+      const chatSnap = await getDoc(doc(db, 'chats', firestoreChatId));
+      if (chatSnap.exists()) participantData = chatSnap.data().participantData || {};
+    } catch {
+      // ignore
+    }
+    activeChatUnsubscribeRef.current = subscribeMessages(firestoreChatId, (payload) => {
+      const mapped: Message[] = payload.documents.map((doc: any) => {
+        const sid = doc.senderId || doc.userId;
+        const senderName = doc.role === 'bot' ? 'ECSTASY BOT' : (doc.senderDisplayName || participantData[sid]?.displayName || (sid === currentUserId ? displayName : 'Unknown'));
+        const createdAt = toDate(doc.createdAt);
+        return {
+          id: doc.$id,
+          senderId: sid,
+          senderName,
+          text: doc.content,
+          timestamp: createdAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          type: doc.type || 'text',
+          imageUrl: doc.imageUrl || undefined,
+          replyTo: doc.replyTo || undefined,
+          reactions: doc.reactions || {},
+          createdAt,
+        };
+      });
       setChatMessages(prev => ({ ...prev, [chatId]: mapped }));
+    });
+    if (typingUnsubRef.current) typingUnsubRef.current();
+    typingUnsubRef.current = subscribeTyping(firestoreChatId, (typers) => {
+      setTypingIndicators(typers.filter((t) => t.userId !== currentUserId));
     });
   };
 
@@ -679,6 +757,11 @@ const App: React.FC = () => {
       activeChatUnsubscribeRef.current();
       activeChatUnsubscribeRef.current = null;
     }
+    if (typingUnsubRef.current) {
+      typingUnsubRef.current();
+      typingUnsubRef.current = null;
+    }
+    setTypingIndicators([]);
   }, [activeChat]);
 
   useEffect(() => () => {
@@ -686,7 +769,28 @@ const App: React.FC = () => {
       activeChatUnsubscribeRef.current();
       activeChatUnsubscribeRef.current = null;
     }
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    if (typingUnsubRef.current) typingUnsubRef.current();
   }, []);
+
+  useEffect(() => {
+    if (!activeChat || !currentUserId) return;
+    const fid = chatDocIds[activeChat.id] || (activeChat.isRoom ? activeChat.id : null);
+    if (!fid) return;
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    if (chatInput.trim()) {
+      void setTyping(fid, currentUserId, displayName || 'You', true);
+      typingTimeoutRef.current = setTimeout(() => {
+        void setTyping(fid, currentUserId, displayName || 'You', false);
+        typingTimeoutRef.current = null;
+      }, 3000);
+    } else {
+      void setTyping(fid, currentUserId, displayName || 'You', false);
+    }
+    return () => {
+      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    };
+  }, [chatInput, activeChat, currentUserId, displayName, chatDocIds]);
 
   const handleSendMessage = async (text: string, type: 'text' | 'image' | 'roast' = 'text') => {
     if (!text.trim() || !activeChat) return;
@@ -718,13 +822,16 @@ const App: React.FC = () => {
       }
     }
 
+    const now = new Date();
     const userMsg: Message = {
       id: Date.now().toString(),
       senderId: currentUserId || 'local',
       senderName: displayName || 'YOU',
       text: text,
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      type: type
+      timestamp: now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      type: type,
+      replyTo: replyToMessage ? { messageId: replyToMessage.id, text: replyToMessage.text, senderName: replyToMessage.senderName } : undefined,
+      createdAt: now,
     };
 
     setChatMessages(prev => ({
@@ -754,7 +861,14 @@ const App: React.FC = () => {
           content: text,
           language: preferredLanguage,
           type,
+          senderDisplayName: displayName || 'You',
+          lastSenderDisplayName: activeChat.isRoom ? (displayName || 'You') : undefined,
+          replyTo: replyToMessage ? { messageId: replyToMessage.id, text: replyToMessage.text.slice(0, 100), senderName: replyToMessage.senderName } : undefined,
         });
+        setReplyToMessage(null);
+        if (activeChat && chatDocIds[activeChat.id]) {
+          void setTyping(chatDocIds[activeChat.id], currentUserId!, displayName || 'You', false);
+        }
       } catch (err) {
         setChatMessages(prev => ({
           ...prev,
@@ -1044,6 +1158,8 @@ const App: React.FC = () => {
     setCallMode(null);
     setChatInput("");
     setShowEmojiPicker(false);
+    setReplyToMessage(null);
+    setMessageContextMenu(null);
     if (currentUserId) {
       loadChatFromBackend(item.id, item.name, isRoom).catch(err => console.error("Load chat error:", err));
     } else if (!chatMessages[item.id]) {
@@ -1051,24 +1167,51 @@ const App: React.FC = () => {
     }
   };
 
-  const handleCreateGroup = () => {
-    if (!newGroupName.trim() || selectedMembers.length === 0) return;
-    
-    const newRoom: ActiveRoom = {
-      id: `r-${Date.now()}`,
-      name: newGroupName,
-      membersCount: selectedMembers.length + 1,
-      lastMessage: 'Tribe created! Let the bakchodi begin.',
-      lastSender: 'YOU',
-      isLive: false,
-      avatar: `https://picsum.photos/seed/${newGroupName}/200`
-    };
-
-    setRooms([newRoom, ...rooms]);
-    setIsCreatingGroup(false);
-    setNewGroupName("");
-    setSelectedMembers([]);
-    selectChat(newRoom, true);
+  const handleCreateGroup = async () => {
+    if (!newGroupName.trim() || !currentUserId) return;
+    setTribeCreateError(null);
+    setTribeCreateLoading(true);
+    try {
+      const participantIds = selectedMembers.filter((id) => id && id !== currentUserId);
+      const participantData: Record<string, { displayName: string }> = {
+        [currentUserId]: { displayName: displayName || 'You' },
+      };
+      contacts.forEach((c) => {
+        const uid = c.appUserId || (c.onBakchod ? c.id : null);
+        if (uid && participantIds.includes(uid)) participantData[uid] = { displayName: c.name };
+      });
+      tribeSearchedUsers.forEach((u) => {
+        if (participantIds.includes(u.id)) participantData[u.id] = { displayName: u.displayName || u.email || 'Unknown' };
+      });
+      const chat = await createRoom({
+        name: newGroupName.trim(),
+        ownerId: currentUserId,
+        participantIds,
+        participantData,
+      });
+      const newRoom: ActiveRoom = {
+        id: chat.$id,
+        name: newGroupName.trim(),
+        membersCount: participantIds.length + 1,
+        lastMessage: 'Tribe created! Let the bakchodi begin.',
+        lastSender: 'YOU',
+        isLive: false,
+        avatar: `https://picsum.photos/seed/${encodeURIComponent(newGroupName)}/200`,
+      };
+      setRooms((prev) => [newRoom, ...prev.filter((r) => r.id !== chat.$id)]);
+      setIsCreatingGroup(false);
+      setNewGroupName('');
+      setSelectedMembers([]);
+      setTribeMemberSearch('');
+      setTribeSearchedUsers([]);
+      selectChat(newRoom, true);
+    } catch (err: any) {
+      const msg = err?.message || err?.code || 'Failed to create tribe. Please try again.';
+      setTribeCreateError(msg);
+      console.error('Create tribe error:', err);
+    } finally {
+      setTribeCreateLoading(false);
+    }
   };
 
   const toggleMemberSelection = (id: string) => {
@@ -1351,7 +1494,7 @@ const App: React.FC = () => {
       return (
         <div className="flex-1 flex flex-col bg-night-black animate-in slide-in-from-right duration-300">
           <div className="flex items-center gap-3 p-4 border-b border-white/5">
-            <button onClick={() => setIsCreatingGroup(false)} className="text-accent-red">
+            <button onClick={() => { setIsCreatingGroup(false); setTribeCreateError(null); setTribeMemberSearch(''); setTribeSearchedUsers([]); }} className="text-accent-red">
               <span className="material-symbols-outlined">close</span>
             </button>
             <h2 className="text-sm font-party text-white uppercase tracking-widest">Create New Tribe</h2>
@@ -1371,37 +1514,78 @@ const App: React.FC = () => {
 
             <div className="space-y-3">
               <p className="text-[10px] text-accent-red font-bold uppercase tracking-widest px-1">Select Legends ({selectedMembers.length})</p>
-              <div className="grid grid-cols-1 gap-2 max-h-[400px] overflow-y-auto no-scrollbar pb-10">
-                {contacts.length === 0 ? (
-                  <div className="p-4 text-[10px] uppercase tracking-widest text-gray-500 bg-white/5 border border-white/10 rounded-xl">
-                    No contacts yet. Add from a chat or call history.
-                  </div>
-                ) : (
-                  contacts.map(user => (
-                    <div 
-                      key={user.id} 
-                      onClick={() => toggleMemberSelection(user.id)}
-                      className={`flex items-center gap-3 p-3 rounded-xl border transition-all cursor-pointer ${selectedMembers.includes(user.id) ? 'bg-accent-red/10 border-accent-red' : 'bg-white/5 border-white/5'}`}
-                    >
-                      <div className="size-10 rounded-lg bg-cover border border-white/10" style={{ backgroundImage: `url(${user.avatar})` }} />
-                      <p className="text-[12px] font-bold text-white flex-1">{user.name}</p>
-                      <div className={`size-5 rounded-full border-2 flex items-center justify-center transition-all ${selectedMembers.includes(user.id) ? 'bg-accent-red border-accent-red' : 'border-white/20'}`}>
-                        {selectedMembers.includes(user.id) && <span className="material-symbols-outlined text-white text-[12px] font-bold">check</span>}
-                      </div>
+              <input
+                value={tribeMemberSearch}
+                onChange={(e) => setTribeMemberSearch(e.target.value)}
+                placeholder="Search registered users..."
+                className="w-full bg-accent-red/5 border-2 border-accent-red/30 rounded-xl px-4 py-2.5 text-sm text-white placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-accent-red/20 transition-all"
+              />
+              <div className="grid grid-cols-1 gap-2 max-h-[320px] overflow-y-auto no-scrollbar pb-10">
+                {tribeMemberSearch.trim() ? (
+                  tribeSearchedUsers.length === 0 ? (
+                    <div className="p-4 text-[10px] uppercase tracking-widest text-gray-500 bg-white/5 border border-white/10 rounded-xl">
+                      No users found. Try a different search.
                     </div>
-                  ))
+                  ) : (
+                    tribeSearchedUsers.map((u) => (
+                      <div
+                        key={u.id}
+                        onClick={() => toggleMemberSelection(u.id)}
+                        className={`flex items-center gap-3 p-3 rounded-xl border transition-all cursor-pointer ${selectedMembers.includes(u.id) ? 'bg-accent-red/10 border-accent-red' : 'bg-white/5 border-white/5'}`}
+                      >
+                        <div className="size-10 rounded-lg bg-cover border border-white/10" style={{ backgroundImage: `url(https://picsum.photos/seed/${encodeURIComponent(u.id)}/200)` }} />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-[12px] font-bold text-white truncate">{u.displayName || u.email || 'Unknown'}</p>
+                          {u.email && <p className="text-[9px] text-gray-500 truncate">{u.email}</p>}
+                        </div>
+                        <div className={`size-5 rounded-full border-2 flex items-center justify-center transition-all ${selectedMembers.includes(u.id) ? 'bg-accent-red border-accent-red' : 'border-white/20'}`}>
+                          {selectedMembers.includes(u.id) && <span className="material-symbols-outlined text-white text-[12px] font-bold">check</span>}
+                        </div>
+                      </div>
+                    ))
+                  )
+                ) : (
+                  (() => {
+                    const registeredContacts = contacts.filter((c) => c.onBakchod && (c.appUserId || c.id));
+                    return registeredContacts.length === 0 ? (
+                      <div className="p-4 text-[10px] uppercase tracking-widest text-gray-500 bg-white/5 border border-white/10 rounded-xl">
+                        No registered contacts yet. Add contacts from chat or search above.
+                      </div>
+                    ) : (
+                      registeredContacts.map((user) => {
+                        const uid = user.appUserId || user.id;
+                        return (
+                          <div
+                            key={uid}
+                            onClick={() => toggleMemberSelection(uid)}
+                            className={`flex items-center gap-3 p-3 rounded-xl border transition-all cursor-pointer ${selectedMembers.includes(uid) ? 'bg-accent-red/10 border-accent-red' : 'bg-white/5 border-white/5'}`}
+                          >
+                            <div className="size-10 rounded-lg bg-cover border border-white/10" style={{ backgroundImage: `url(${user.avatar})` }} />
+                            <p className="text-[12px] font-bold text-white flex-1">{user.name}</p>
+                            <div className={`size-5 rounded-full border-2 flex items-center justify-center transition-all ${selectedMembers.includes(uid) ? 'bg-accent-red border-accent-red' : 'border-white/20'}`}>
+                              {selectedMembers.includes(uid) && <span className="material-symbols-outlined text-white text-[12px] font-bold">check</span>}
+                            </div>
+                          </div>
+                        );
+                      })
+                    );
+                  })()
                 )}
               </div>
             </div>
           </div>
 
-          <div className="mt-auto p-6 bg-night-black border-t border-white/5">
+          <div className="mt-auto p-6 bg-night-black border-t border-white/5 space-y-2">
+            {tribeCreateError && (
+              <p className="text-[10px] text-vibrant-pink uppercase tracking-wider">{tribeCreateError}</p>
+            )}
             <button 
-              disabled={!newGroupName.trim() || selectedMembers.length === 0}
-              onClick={handleCreateGroup}
+              type="button"
+              disabled={!newGroupName.trim() || tribeCreateLoading}
+              onClick={() => void handleCreateGroup()}
               className="w-full py-4 bg-accent-red text-white font-party text-xs uppercase tracking-[0.2em] rounded-2xl shadow-[0_10px_30px_rgba(255,0,60,0.3)] disabled:opacity-30 disabled:grayscale transition-all active:scale-95"
             >
-              Assemble Tribe
+              {tribeCreateLoading ? 'Creating...' : 'Assemble Tribe'}
             </button>
           </div>
         </div>
@@ -1426,7 +1610,13 @@ const App: React.FC = () => {
         <div className="flex-1 flex flex-col h-full bg-night-black">
           {/* Contact Header */}
           <div className="flex items-center gap-2 p-3 border-b border-white/5 bg-night-panel/30">
-            <button onClick={() => setActiveChat(null)} className="p-1 text-white/40 hover:text-white">
+            <button onClick={() => {
+              if (activeChat && currentUserId && (chatDocIds[activeChat.id] || (activeChat.isRoom && activeChat.id))) {
+                const fid = chatDocIds[activeChat.id] || activeChat.id;
+                void setTyping(fid, currentUserId, displayName || 'You', false);
+              }
+              setActiveChat(null);
+            }} className="p-1 text-white/40 hover:text-white">
               <span className="material-symbols-outlined text-xl">chevron_left</span>
             </button>
             <div className="size-8 rounded-lg bg-center bg-cover border border-accent-red/20" style={{ backgroundImage: `url(${activeChat.avatar})` }} />
@@ -1495,14 +1685,74 @@ const App: React.FC = () => {
               {messages.length === 0 && !isCalling && (
                 <div className="text-center py-10 opacity-20"><span className="material-symbols-outlined text-5xl mb-2">chat_bubble</span><p className="text-[10px] font-party uppercase">No messages yet. Say something!</p></div>
               )}
-              {messages.map((msg) => (
-                <div key={msg.id} className={`flex flex-col ${msg.senderId === '1' ? 'items-end' : 'items-start'}`}>
-                  <div className={`max-w-[75%] px-4 py-2.5 rounded-2xl text-[11px] leading-snug ${msg.senderId === '1' ? 'bg-accent-red text-white rounded-tr-none shadow-lg' : 'bg-white/5 text-white/80 rounded-tl-none border border-white/10'}`}>
-                    {msg.text}
-                  </div>
-                  <span className="text-[8px] text-gray-600 mt-1 px-1">{msg.timestamp}</span>
+              {messages.map((msg, idx) => {
+                const prevDate = messages[idx - 1]?.createdAt;
+                const currDate = msg.createdAt;
+                const showDateSep = !prevDate || !currDate || prevDate.toDateString() !== currDate.toDateString();
+                const dateLabel = currDate ? (currDate.toDateString() === new Date().toDateString() ? 'Today' : currDate.toDateString() === new Date(Date.now() - 864e5).toDateString() ? 'Yesterday' : currDate.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })) : '';
+                const firestoreChatId = chatDocIds[activeChat.id] || (activeChat.isRoom ? activeChat.id : null);
+                return (
+                  <React.Fragment key={msg.id}>
+                    {showDateSep && dateLabel && (
+                      <div className="flex justify-center py-2">
+                        <span className="text-[9px] text-gray-500 bg-white/5 px-3 py-1 rounded-full uppercase tracking-widest">{dateLabel}</span>
+                      </div>
+                    )}
+                    <div
+                      className={`flex flex-col ${msg.senderId === currentUserId ? 'items-end' : 'items-start'} group`}
+                      onContextMenu={(e) => { e.preventDefault(); setMessageContextMenu({ msg, x: Math.min(e.clientX, window.innerWidth - 160), y: e.clientY }); }}
+                    >
+                      {activeChat.isRoom && (
+                        <span className={`text-[9px] font-bold text-accent-red/80 mb-0.5 px-1 ${msg.senderId === currentUserId ? 'text-right' : 'text-left'}`}>
+                          {msg.senderId === currentUserId ? 'You' : (msg.senderName || 'Unknown')}
+                        </span>
+                      )}
+                      <div className={`max-w-[75%] px-4 py-2.5 rounded-2xl text-[11px] leading-snug relative ${msg.senderId === currentUserId ? 'bg-accent-red text-white rounded-tr-none shadow-lg' : 'bg-white/5 text-white/80 rounded-tl-none border border-white/10'}`}>
+                        {msg.replyTo && (
+                          <div className={`mb-1.5 pl-2 border-l-2 ${msg.senderId === currentUserId ? 'border-white/40' : 'border-accent-red/40'}`}>
+                            <p className="text-[9px] font-bold opacity-90">{msg.replyTo.senderName}</p>
+                            <p className="text-[9px] opacity-75 truncate max-w-[200px]">{msg.replyTo.text}</p>
+                          </div>
+                        )}
+                        {msg.text}
+                        {Object.keys(msg.reactions || {}).length > 0 && (
+                          <div className="flex flex-wrap gap-1.5 mt-1.5">
+                            {Object.entries(
+                              Object.entries(msg.reactions || {}).reduce<Record<string, number>>((acc, [, emoji]) => {
+                                acc[emoji] = (acc[emoji] || 0) + 1;
+                                return acc;
+                              }, {})
+                            ).map(([emoji, count]) => (
+                              <span key={emoji} className="text-xs bg-white/10 px-1.5 py-0.5 rounded-full" title={`${count} reaction${count > 1 ? 's' : ''}`}>{emoji} {count > 1 ? count : ''}</span>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2 mt-1 px-1">
+                        <span className="text-[8px] text-gray-600">{msg.timestamp}</span>
+                        {firestoreChatId && (
+                          <>
+                            <button type="button" onClick={(e) => { e.stopPropagation(); const rect = (e.target as HTMLElement).getBoundingClientRect(); setMessageContextMenu({ msg, x: Math.min(rect.left, window.innerWidth - 160), y: rect.bottom + 4 }); }} className="p-0.5 rounded hover:bg-white/10 text-white/50 hover:text-accent-red opacity-60 hover:opacity-100" title="Message options">
+                              <span className="material-symbols-outlined text-sm">more_horiz</span>
+                            </button>
+                            <div className="opacity-0 group-hover:opacity-100 flex gap-0.5 transition-opacity">
+                              {REACTION_EMOJIS.map((emoji) => (
+                                <button key={emoji} onClick={() => void addMessageReaction(firestoreChatId, msg.id, currentUserId!, (msg.reactions || {})[currentUserId!] === emoji ? '' : emoji)} className="text-xs hover:scale-125 transition-transform" title="React">{emoji}</button>
+                              ))}
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  </React.Fragment>
+                );
+              })}
+              {typingIndicators.length > 0 && (
+                <div className="flex items-center gap-2 text-[10px] text-accent-red/80 animate-pulse">
+                  <span className="flex gap-1"><span className="w-1 h-1 rounded-full bg-accent-red animate-bounce" /><span className="w-1 h-1 rounded-full bg-accent-red animate-bounce [animation-delay:0.2s]" /><span className="w-1 h-1 rounded-full bg-accent-red animate-bounce [animation-delay:0.4s]" /></span>
+                  {typingIndicators.map((t) => t.displayName).filter(Boolean).join(', ')} typing...
                 </div>
-              ))}
+              )}
               <div ref={chatEndRef} />
             </div>
 
@@ -1520,6 +1770,17 @@ const App: React.FC = () => {
           </div>
 
           <div className="p-3 bg-night-black border-t border-white/5 space-y-2">
+            {replyToMessage && (
+              <div className="flex items-center justify-between bg-accent-red/10 border border-accent-red/30 rounded-xl px-3 py-2">
+                <div className="flex-1 min-w-0">
+                  <p className="text-[9px] font-bold text-accent-red uppercase">Replying to {replyToMessage.senderName}</p>
+                  <p className="text-[10px] text-white/80 truncate">{replyToMessage.text.slice(0, 50)}{replyToMessage.text.length > 50 ? '...' : ''}</p>
+                </div>
+                <button type="button" onClick={() => setReplyToMessage(null)} className="text-accent-red p-1 hover:bg-accent-red/20 rounded-full">
+                  <span className="material-symbols-outlined text-lg">close</span>
+                </button>
+              </div>
+            )}
             {showEmojiPicker && (
               <div className="bg-night-panel border-2 border-accent-red rounded-2xl p-2 animate-in slide-in-from-bottom-2 shadow-[0_0_30px_rgba(255,0,60,0.4)]">
                 <div className="grid grid-cols-8 gap-2 max-h-[180px] overflow-y-auto no-scrollbar">
@@ -1552,6 +1813,25 @@ const App: React.FC = () => {
                 <span className="material-symbols-outlined text-2xl font-bold">send</span>
               </button>
             </form>
+            {messageContextMenu && (
+              <>
+                <div className="fixed inset-0 z-40" onClick={() => setMessageContextMenu(null)} />
+                <div className="fixed z-50 bg-night-panel border border-accent-red/30 rounded-xl shadow-xl py-1 min-w-[140px]" style={{ left: Math.min(messageContextMenu.x, window.innerWidth - 150), top: messageContextMenu.y + 140 > window.innerHeight ? messageContextMenu.y - 130 : messageContextMenu.y + 4 }}>
+                  <button onClick={() => { setReplyToMessage(messageContextMenu.msg); setMessageContextMenu(null); }} className="w-full px-4 py-2 text-left text-[11px] font-bold text-white hover:bg-accent-red/20 flex items-center gap-2">
+                    <span className="material-symbols-outlined text-base">reply</span> Reply
+                  </button>
+                  <button onClick={() => { navigator.clipboard?.writeText(messageContextMenu.msg.text); setMessageContextMenu(null); }} className="w-full px-4 py-2 text-left text-[11px] font-bold text-white hover:bg-accent-red/20 flex items-center gap-2">
+                    <span className="material-symbols-outlined text-base">content_copy</span> Copy
+                  </button>
+                  <div className="border-t border-white/10 my-1" />
+                  <div className="px-3 py-1.5 flex gap-1">
+                    {REACTION_EMOJIS.map((emoji) => (
+                      <button key={emoji} onClick={() => { const fid = chatDocIds[activeChat!.id] || (activeChat!.isRoom ? activeChat!.id : null); if (fid) void addMessageReaction(fid, messageContextMenu.msg.id, currentUserId!, (messageContextMenu.msg.reactions || {})[currentUserId!] === emoji ? '' : emoji); setMessageContextMenu(null); }} className="text-lg hover:scale-125 transition-transform">{emoji}</button>
+                    ))}
+                  </div>
+                </div>
+              </>
+            )}
           </div>
         </div>
       );
@@ -1603,9 +1883,10 @@ const App: React.FC = () => {
                 )}
               </div>
             )}
-            {recentChats.length > 0 && !searchQuery.trim() && (
+            {recentChats.filter((c) => !c.isRoom).length > 0 && !searchQuery.trim() && (
               <div className="px-6 py-3 border-b border-white/5">
-                {recentChats.map((chat) => {
+                <p className="text-[10px] font-party tracking-[0.2em] text-accent-red uppercase mb-2">Direct Chats</p>
+                {recentChats.filter((c) => !c.isRoom).map((chat) => {
                   const otherId = chat.participantIds?.find((p) => p !== currentUserId) || chat.externalId || '';
                   const otherDisplayName = chat.participantData?.[otherId]?.displayName || chat.name || 'Unknown';
                   const chatUser: User = {
@@ -1633,7 +1914,7 @@ const App: React.FC = () => {
                 })}
               </div>
             )}
-            {filteredRooms.length > 0 && (searchQuery.trim() || recentChats.length > 0) && (
+            {filteredRooms.length > 0 && (
               <p className="px-6 pt-4 pb-2 text-[10px] font-party tracking-[0.2em] text-accent-red uppercase">Tribes</p>
             )}
             {filteredRooms.map((room) => (
@@ -1914,7 +2195,13 @@ const App: React.FC = () => {
         <StoryBar
           searchQuery={activeTab === 'party' || activeTab === 'hotline' ? searchQuery : ""}
           users={storyBarUsers}
-          onSelectUser={(user) => { void handleSelectContact(user); }}
+          onSelectUser={(user) => {
+          if ((user as User & { isRoom?: boolean }).isRoom) {
+            selectChat(user, true);
+          } else {
+            void handleSelectContact(user);
+          }
+        }}
         />
       )}
 

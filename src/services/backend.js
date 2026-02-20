@@ -13,6 +13,7 @@ import {
   onSnapshot,
   setDoc,
   writeBatch,
+  deleteDoc,
 } from 'firebase/firestore';
 import { signOut } from 'firebase/auth';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
@@ -103,6 +104,23 @@ export async function unblockUserCallable(targetUserId) {
   }
 }
 
+export async function createRoom(params) {
+  const { name, ownerId, participantIds, participantData } = params;
+  const uniqueIds = [...new Set([ownerId, ...(participantIds || [])])];
+  const created = await addDoc(collection(db, 'chats'), {
+    ownerId,
+    name,
+    isRoom: true,
+    type: 'room',
+    participantIds: uniqueIds,
+    participantData: participantData || {},
+    updatedAt: serverTimestamp(),
+    createdAt: serverTimestamp(),
+  });
+  const snap = await getDoc(doc(db, 'chats', created.id));
+  return { $id: snap.id, ...snap.data() };
+}
+
 export async function getOrCreateChat(params) {
   if (!params.isRoom && !params.externalId.startsWith('r-')) {
     const participantIds = [params.userId, params.externalId].sort();
@@ -175,7 +193,7 @@ export async function createMessage(input) {
   const chatRef = doc(db, 'chats', input.chatId);
   const messagesRef = collection(db, 'chats', input.chatId, 'messages');
   const messageRef = doc(messagesRef);
-  batch.set(messageRef, {
+  const msgData = {
     senderId: input.userId,
     userId: input.userId,
     role: input.role,
@@ -183,14 +201,61 @@ export async function createMessage(input) {
     language: input.language,
     type: input.type,
     imageUrl: input.imageUrl || null,
+    senderDisplayName: input.senderDisplayName || null,
     createdAt: serverTimestamp(),
-  });
-  batch.update(chatRef, {
+  };
+  if (input.replyTo) {
+    msgData.replyTo = input.replyTo;
+  }
+  batch.set(messageRef, msgData);
+  const updateData = {
     lastMessage: input.content,
     lastMessageAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
-  });
+  };
+  if (input.lastSenderDisplayName) {
+    updateData.lastSender = input.userId;
+    updateData.lastSenderDisplayName = input.lastSenderDisplayName;
+  }
+  batch.update(chatRef, updateData);
   await batch.commit();
+}
+
+export async function addMessageReaction(chatId, messageId, userId, emoji) {
+  const msgRef = doc(db, 'chats', chatId, 'messages', messageId);
+  const snap = await getDoc(msgRef);
+  if (!snap.exists()) return;
+  const reactions = { ...(snap.data().reactions || {}) };
+  if (emoji) {
+    reactions[userId] = emoji;
+  } else {
+    delete reactions[userId];
+  }
+  await updateDoc(msgRef, { reactions });
+}
+
+export async function setTyping(chatId, userId, displayName, isTyping) {
+  const typingRef = doc(db, 'chats', chatId, 'typing', userId);
+  if (isTyping) {
+    await setDoc(typingRef, { displayName, at: serverTimestamp() }, { merge: true });
+  } else {
+    try {
+      await deleteDoc(typingRef);
+    } catch {
+      // doc may not exist
+    }
+  }
+}
+
+export function subscribeTyping(chatId, callback) {
+  const typingRef = collection(db, 'chats', chatId, 'typing');
+  return onSnapshot(typingRef, (snapshot) => {
+    const now = Date.now();
+    const typers = snapshot.docs
+      .map((d) => ({ userId: d.id, ...d.data() }))
+      .filter((t) => t.userId && t.at && (now - (t.at?.toMillis?.() || 0)) < 5000);
+    callback(typers);
+  });
 }
 
 export async function createInvite(input) {

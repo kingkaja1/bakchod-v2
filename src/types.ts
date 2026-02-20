@@ -9,6 +9,12 @@ export interface User {
   appUserId?: string | null;
 }
 
+export interface ReplyTo {
+  messageId: string;
+  text: string;
+  senderName: string;
+}
+
 export interface Message {
   id: string;
   senderId: string;
@@ -17,6 +23,9 @@ export interface Message {
   timestamp: string;
   type: 'text' | 'image' | 'roast';
   imageUrl?: string;
+  replyTo?: ReplyTo;
+  reactions?: Record<string, string>;
+  createdAt?: Date;
 }
 
 export interface ActiveRoom {
