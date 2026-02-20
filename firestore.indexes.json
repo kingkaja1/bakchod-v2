@@ -7,6 +7,14 @@
         { "fieldPath": "participants", "order": "ASCENDING" },
         { "fieldPath": "lastMessageAt", "order": "DESCENDING" }
       ]
+    },
+    {
+      "collectionGroup": "invites",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "targetType", "order": "ASCENDING" },
+        { "fieldPath": "targetValue", "order": "ASCENDING" }
+      ]
     }
   ],
   "fieldOverrides": []

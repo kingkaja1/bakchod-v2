@@ -1,7 +1,6 @@
 
 import React, { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import Layout from './components/Layout';
-import StoryBar from './components/StoryBar';
 import { generateRoast } from './services/geminiService';
 import { auth, db, functions } from './services/firebaseClient';
 import { httpsCallable } from 'firebase/functions';
@@ -27,6 +26,10 @@ import {
   unblockUserCallable,
   searchUsersByDisplayName,
   addContactToBackend,
+  deleteMessage as deleteMessageBackend,
+  clearChat as clearChatBackend,
+  markChatRead,
+  uploadChatFile,
 } from './services/backend';
 import { User, ActiveRoom, Message } from './types';
 import { useUserContext } from './contexts/UserContext';
@@ -44,6 +47,7 @@ interface CallHistoryItem {
   timestamp: string;
   isMissed: boolean;
   contactId: string;
+  isRoom: boolean;
 }
 
 type InviteModalProps = {
@@ -263,10 +267,10 @@ const App: React.FC = () => {
   
   // Call History State
   const [callHistory, setCallHistory] = useState<CallHistoryItem[]>([
-    { id: 'h1', name: 'RAHUL', avatar: 'https://picsum.photos/seed/rahul/200', type: 'video', timestamp: 'Yesterday, 11:45 PM', isMissed: false, contactId: '2' },
-    { id: 'h2', name: 'PRIYA', avatar: 'https://picsum.photos/seed/priya/200', type: 'audio', timestamp: 'Today, 2:15 AM', isMissed: true, contactId: '3' },
-    { id: 'h3', name: 'THE BOYS 🍻', avatar: 'https://picsum.photos/seed/boys/200', type: 'video', timestamp: '2 days ago', isMissed: false, contactId: 'r1' },
-    { id: 'h4', name: 'RAHUL', avatar: 'https://picsum.photos/seed/rahul/200', type: 'audio', timestamp: 'Last Monday', isMissed: false, contactId: '2' },
+    { id: 'h1', name: 'RAHUL', avatar: 'https://picsum.photos/seed/rahul/200', type: 'video', timestamp: 'Yesterday, 11:45 PM', isMissed: false, contactId: '2', isRoom: false },
+    { id: 'h2', name: 'PRIYA', avatar: 'https://picsum.photos/seed/priya/200', type: 'audio', timestamp: 'Today, 2:15 AM', isMissed: true, contactId: '3', isRoom: false },
+    { id: 'h3', name: 'THE BOYS 🍻', avatar: 'https://picsum.photos/seed/boys/200', type: 'video', timestamp: '2 days ago', isMissed: false, contactId: 'r1', isRoom: true },
+    { id: 'h4', name: 'RAHUL', avatar: 'https://picsum.photos/seed/rahul/200', type: 'audio', timestamp: 'Last Monday', isMissed: false, contactId: '2', isRoom: false },
   ]);
 
   // User Profile State
@@ -279,6 +283,7 @@ const App: React.FC = () => {
   const [replyToMessage, setReplyToMessage] = useState<Message | null>(null);
   const [typingIndicators, setTypingIndicators] = useState<Array<{ userId: string; displayName?: string }>>([]);
   const [messageContextMenu, setMessageContextMenu] = useState<{ msg: Message; x: number; y: number } | null>(null);
+  const [chatMenuOpen, setChatMenuOpen] = useState(false);
   const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const typingUnsubRef = useRef<(() => void) | null>(null);
   
@@ -303,6 +308,8 @@ const App: React.FC = () => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const chatAttachRef = useRef<HTMLInputElement>(null);
+  const [isUploadingMedia, setIsUploadingMedia] = useState(false);
   const [stream, setStream] = useState<MediaStream | null>(null);
   const activeChatUnsubscribeRef = useRef<null | (() => void)>(null);
 
@@ -419,7 +426,7 @@ const App: React.FC = () => {
   useEffect(() => {
     if (authStatus !== 'authed' || !currentUserId) return;
     fetchInvites();
-    const unsubscribe = subscribeInvites(() => {
+    const unsubscribe = subscribeInvites(currentUserId, () => {
       fetchInvites();
     });
     return () => {
@@ -570,37 +577,6 @@ const App: React.FC = () => {
     );
   }, [searchQuery, activeTab, callHistory]);
 
-  const storyBarUsers = useMemo(() => {
-    const fromDirectChats: User[] = recentChats
-      .filter((chat) => !chat.isRoom)
-      .map((chat) => {
-        const otherId = chat.participantIds?.find((p) => p !== currentUserId) || chat.externalId || '';
-        const otherDisplayName = chat.participantData?.[otherId]?.displayName || chat.name || 'Unknown';
-        return {
-          id: otherId,
-          name: otherDisplayName.toUpperCase(),
-          avatar: `https://picsum.photos/seed/${encodeURIComponent(otherId)}/200`,
-          status: 'online' as const,
-          onBakchod: true,
-          appUserId: otherId,
-        };
-      });
-    const fromRooms = recentChats
-      .filter((chat) => chat.isRoom)
-      .map((chat) => ({
-        id: chat.$id,
-        name: (chat.name || 'Tribe').toUpperCase(),
-        avatar: `https://picsum.photos/seed/${encodeURIComponent(chat.name || chat.$id)}/200`,
-        status: 'online' as const,
-        onBakchod: true,
-        appUserId: chat.$id,
-        isRoom: true,
-      }));
-    const chatIds = new Set([...fromDirectChats.map((u) => u.id), ...fromRooms.map((u) => u.id)]);
-    const fromContacts = contacts.filter((c) => !chatIds.has(c.id) && !chatIds.has(c.appUserId || ''));
-    return [...fromDirectChats, ...fromRooms, ...fromContacts];
-  }, [recentChats, contacts, currentUserId]);
-
   // AI Interaction
   const handleBotAction = async (topic: string) => {
     if (isLoadingRoast || !topic.trim()) return;
@@ -696,6 +672,45 @@ const App: React.FC = () => {
     }
   };
 
+  const handleClearChat = async () => {
+    if (!activeChat || !currentUserId) return;
+    const fid = chatDocIds[activeChat.id] || (activeChat.isRoom ? activeChat.id : null);
+    if (!fid) {
+      window.alert('Chat not loaded yet. Wait a moment and try again.');
+      return;
+    }
+    if (!window.confirm(`Clear all messages in this ${activeChat.isRoom ? 'tribe' : 'chat'}? This cannot be undone.`)) return;
+    setChatMenuOpen(false);
+    try {
+      await clearChatBackend(fid);
+      setChatMessages((prev) => ({ ...prev, [activeChat.id]: [] }));
+    } catch (err: any) {
+      const msg = err?.message || 'Failed to clear chat.';
+      const code = err?.code || err?.name || '';
+      console.error('Clear chat error:', code, msg, err);
+      window.alert(code === 'permission-denied' || msg.includes('permission')
+        ? 'Permission denied. Make sure you are in this chat and try again. If it persists, sign out and sign back in.'
+        : msg);
+    }
+  };
+
+  const handleDeleteMessage = async (msg: Message) => {
+    if (!activeChat || !currentUserId) return;
+    const fid = chatDocIds[activeChat.id] || (activeChat.isRoom ? activeChat.id : null);
+    if (!fid) return;
+    setMessageContextMenu(null);
+    if (!window.confirm('Delete this message?')) return;
+    try {
+      await deleteMessageBackend(fid, msg.id);
+      setChatMessages((prev) => ({
+        ...prev,
+        [activeChat.id]: (prev[activeChat.id] || []).filter((m) => m.id !== msg.id),
+      }));
+    } catch (err: any) {
+      window.alert(err?.message || 'Failed to delete message.');
+    }
+  };
+
   const loadChatFromBackend = async (chatId: string, name: string, isRoom: boolean) => {
     if (!currentUserId) return;
     const firestoreChatId = isRoom ? chatId : (await getOrCreateChat({
@@ -725,6 +740,7 @@ const App: React.FC = () => {
     } catch {
       // ignore
     }
+    void markChatRead(firestoreChatId, currentUserId);
     activeChatUnsubscribeRef.current = subscribeMessages(firestoreChatId, (payload) => {
       const mapped: Message[] = payload.documents.map((doc: any) => {
         const sid = doc.senderId || doc.userId;
@@ -792,8 +808,10 @@ const App: React.FC = () => {
     };
   }, [chatInput, activeChat, currentUserId, displayName, chatDocIds]);
 
-  const handleSendMessage = async (text: string, type: 'text' | 'image' | 'roast' = 'text') => {
-    if (!text.trim() || !activeChat) return;
+  const handleSendMessage = async (text: string, type: 'text' | 'image' | 'video' | 'file' | 'roast' = 'text', options?: { imageUrl?: string; fileName?: string }) => {
+    const mediaUrl = options?.imageUrl;
+    const hasContent = (text && text.trim()) || mediaUrl;
+    if (!hasContent || !activeChat) return;
     const selectedContact = contacts.find((c) => c.id === activeChat.id || c.appUserId === activeChat.id);
     if (
       !activeChat.isRoom &&
@@ -822,14 +840,18 @@ const App: React.FC = () => {
       }
     }
 
+    const contentLabel = mediaUrl
+      ? (type === 'image' ? 'Photo' : type === 'video' ? 'Video' : type === 'file' ? (options?.fileName || 'File') : text)
+      : text;
     const now = new Date();
     const userMsg: Message = {
       id: Date.now().toString(),
       senderId: currentUserId || 'local',
       senderName: displayName || 'YOU',
-      text: text,
+      text: contentLabel,
       timestamp: now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      type: type,
+      type,
+      ...(mediaUrl && { imageUrl: mediaUrl }),
       replyTo: replyToMessage ? { messageId: replyToMessage.id, text: replyToMessage.text, senderName: replyToMessage.senderName } : undefined,
       createdAt: now,
     };
@@ -858,9 +880,10 @@ const App: React.FC = () => {
           chatId: chatDoc.$id,
           userId: currentUserId,
           role: 'user',
-          content: text,
+          content: contentLabel,
           language: preferredLanguage,
           type,
+          imageUrl: mediaUrl || undefined,
           senderDisplayName: displayName || 'You',
           lastSenderDisplayName: activeChat.isRoom ? (displayName || 'You') : undefined,
           replyTo: replyToMessage ? { messageId: replyToMessage.id, text: replyToMessage.text.slice(0, 100), senderName: replyToMessage.senderName } : undefined,
@@ -1160,6 +1183,7 @@ const App: React.FC = () => {
     setShowEmojiPicker(false);
     setReplyToMessage(null);
     setMessageContextMenu(null);
+    setChatMenuOpen(false);
     if (currentUserId) {
       loadChatFromBackend(item.id, item.name, isRoom).catch(err => console.error("Load chat error:", err));
     } else if (!chatMessages[item.id]) {
@@ -1236,7 +1260,8 @@ const App: React.FC = () => {
       type: mode,
       timestamp: 'Just now',
       isMissed: false,
-      contactId: target.id
+      contactId: target.id,
+      isRoom: target.isRoom ?? false,
     };
     setCallHistory(prev => [newHistoryItem, ...prev]);
 
@@ -1609,27 +1634,32 @@ const App: React.FC = () => {
       return (
         <div className="flex-1 flex flex-col h-full bg-night-black">
           {/* Contact Header */}
-          <div className="flex items-center gap-2 p-3 border-b border-white/5 bg-night-panel/30">
+          <div className="flex items-center gap-2 p-3 border-b border-white/5 bg-night-panel/30 flex-wrap">
             <button onClick={() => {
               if (activeChat && currentUserId && (chatDocIds[activeChat.id] || (activeChat.isRoom && activeChat.id))) {
                 const fid = chatDocIds[activeChat.id] || activeChat.id;
                 void setTyping(fid, currentUserId, displayName || 'You', false);
               }
               setActiveChat(null);
-            }} className="p-1 text-white/40 hover:text-white">
+            }} className="p-1 text-white/40 hover:text-white shrink-0">
               <span className="material-symbols-outlined text-xl">chevron_left</span>
             </button>
-            <div className="size-8 rounded-lg bg-center bg-cover border border-accent-red/20" style={{ backgroundImage: `url(${activeChat.avatar})` }} />
+            <div className="size-8 rounded-lg bg-center bg-cover border border-accent-red/20 shrink-0" style={{ backgroundImage: `url(${activeChat.avatar})` }} />
             <div className="flex-1 min-w-0">
               <h2 className="text-[12px] font-bold text-white truncate">{activeChat.name}</h2>
               <p className="text-[8px] text-accent-red uppercase font-bold tracking-tighter">
-                {isCalling ? (callMode === 'video' ? 'Video Calling...' : 'Voice Calling...') : activeChat.isRoom ? `${activeChat.id.startsWith('r-') ? 'New ' : ''}Tribe Chat` : 'Active Now'}
+                {isCalling ? (callMode === 'video' ? 'Video Calling...' : 'Voice Calling...') : activeChat.isRoom ? 'Tribe Chat' : 'Active Now'}
               </p>
             </div>
+            {/* Voice & Video - always visible when not in call, for both 1:1 and group */}
             {!isCalling && (
-              <div className="flex gap-2">
-                <button onClick={() => startCall('audio')} className="size-8 rounded-full bg-white/5 flex items-center justify-center text-white/40 hover:text-white transition-all"><span className="material-symbols-outlined text-lg">call</span></button>
-                <button onClick={() => startCall('video')} className="size-8 rounded-full bg-accent-red/10 flex items-center justify-center text-accent-red hover:bg-accent-red hover:text-white transition-all"><span className="material-symbols-outlined text-lg">videocam</span></button>
+              <div className="flex gap-1.5 shrink-0" role="group" aria-label="Call options">
+                <button type="button" onClick={() => startCall('audio')} className="size-9 rounded-full bg-white/10 flex items-center justify-center text-white hover:bg-white/20 transition-all active:scale-95" title={activeChat.isRoom ? 'Voice call tribe' : 'Voice call'}>
+                  <span className="material-symbols-outlined text-lg">call</span>
+                </button>
+                <button type="button" onClick={() => startCall('video')} className="size-9 rounded-full bg-accent-red/20 flex items-center justify-center text-accent-red hover:bg-accent-red hover:text-white transition-all active:scale-95" title={activeChat.isRoom ? 'Video call tribe' : 'Video call'}>
+                  <span className="material-symbols-outlined text-lg">videocam</span>
+                </button>
               </div>
             )}
             {!activeChat.isRoom && !isContactSaved(activeChat.id) && (
@@ -1651,6 +1681,22 @@ const App: React.FC = () => {
                 </button>
               </>
             )}
+            <div className="relative">
+              <button onClick={() => setChatMenuOpen((o) => !o)} className="p-1 text-white/40 hover:text-white" title="Chat options">
+                <span className="material-symbols-outlined text-lg">more_vert</span>
+              </button>
+              {chatMenuOpen && (
+                <>
+                  <div className="fixed inset-0 z-40" onClick={() => setChatMenuOpen(false)} />
+                  <div className="absolute right-0 top-full mt-1 z-50 bg-night-panel border border-accent-red/30 rounded-xl shadow-xl py-1 min-w-[160px]">
+                    <button onClick={handleClearChat} className="w-full px-4 py-2.5 text-left text-[11px] font-bold text-white hover:bg-accent-red/20 flex items-center gap-2">
+                      <span className="material-symbols-outlined text-base">delete_sweep</span>
+                      Clear chat
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
           </div>
 
           <div className="flex-1 p-3 overflow-y-auto no-scrollbar space-y-3 relative">
@@ -1714,7 +1760,25 @@ const App: React.FC = () => {
                             <p className="text-[9px] opacity-75 truncate max-w-[200px]">{msg.replyTo.text}</p>
                           </div>
                         )}
-                        {msg.text}
+                        {msg.type === 'image' && msg.imageUrl && (
+                          <div className="mb-1.5">
+                            <img src={msg.imageUrl} alt={msg.text || 'Image'} className="max-w-full max-h-[280px] rounded-xl object-contain" />
+                            {msg.text && msg.text !== 'Photo' && <p className="text-[10px] mt-1 opacity-90">{msg.text}</p>}
+                          </div>
+                        )}
+                        {msg.type === 'video' && msg.imageUrl && (
+                          <div className="mb-1.5">
+                            <video src={msg.imageUrl} controls className="max-w-full max-h-[280px] rounded-xl" />
+                            {msg.text && msg.text !== 'Video' && <p className="text-[10px] mt-1 opacity-90">{msg.text}</p>}
+                          </div>
+                        )}
+                        {msg.type === 'file' && msg.imageUrl && (
+                          <a href={msg.imageUrl} target="_blank" rel="noopener noreferrer" className="flex items-center gap-2 text-[11px] underline break-all">
+                            <span className="material-symbols-outlined text-base">description</span>
+                            {msg.text && msg.text !== 'File' ? msg.text : 'File'}
+                          </a>
+                        )}
+                        {msg.type !== 'image' && msg.type !== 'video' && (msg.type !== 'file' || !msg.imageUrl) && msg.text}
                         {Object.keys(msg.reactions || {}).length > 0 && (
                           <div className="flex flex-wrap gap-1.5 mt-1.5">
                             {Object.entries(
@@ -1799,9 +1863,31 @@ const App: React.FC = () => {
                 </div>
               </div>
             )}
-            <form onSubmit={(e) => { e.preventDefault(); handleSendMessage(chatInput); setChatInput(""); }} className="flex items-center gap-2 bg-accent-red/5 border-2 border-accent-red rounded-xl px-3 h-11 group focus-within:ring-2 focus:ring-accent-red/30 transition-all">
+            <input ref={chatAttachRef} type="file" accept="image/*,video/*,*/*" className="hidden" onChange={async (e) => {
+              const file = e.target.files?.[0];
+              e.target.value = '';
+              if (!file || !activeChat || !currentUserId) return;
+              const firestoreChatId = chatDocIds[activeChat.id] ?? (await getOrCreateChat({ userId: currentUserId, externalId: activeChat.id, name: activeChat.name, isRoom: activeChat.isRoom, currentUserDisplayName: displayName })).$id;
+              if (!chatDocIds[activeChat.id]) setChatDocIds(prev => ({ ...prev, [activeChat.id]: firestoreChatId }));
+              setIsUploadingMedia(true);
+              try {
+                const url = await uploadChatFile(firestoreChatId, currentUserId, file);
+                const isImage = (file.type || '').startsWith('image/');
+                const isVideo = (file.type || '').startsWith('video/');
+                const kind: 'image' | 'video' | 'file' = isImage ? 'image' : isVideo ? 'video' : 'file';
+                await handleSendMessage(kind === 'file' ? file.name : '', kind, { imageUrl: url, fileName: file.name });
+              } catch (err: any) {
+                window.alert(err?.message || 'Upload failed.');
+              } finally {
+                setIsUploadingMedia(false);
+              }
+            }} />
+            <form onSubmit={(e) => { e.preventDefault(); if (chatInput.trim()) { handleSendMessage(chatInput); setChatInput(""); } }} className="flex items-center gap-2 bg-accent-red/5 border-2 border-accent-red rounded-xl px-3 h-11 group focus-within:ring-2 focus:ring-accent-red/30 transition-all">
               <button type="button" onClick={() => setShowEmojiPicker(!showEmojiPicker)} className={`text-accent-red/60 hover:text-accent-red transition-colors ${showEmojiPicker ? 'text-accent-red' : ''}`}>
                 <span className="material-symbols-outlined text-xl">mood</span>
+              </button>
+              <button type="button" onClick={() => chatAttachRef.current?.click()} disabled={isUploadingMedia} className="text-accent-red/60 hover:text-accent-red disabled:opacity-50 transition-colors" title="Attach photo, video or file">
+                <span className="material-symbols-outlined text-xl">{isUploadingMedia ? 'hourglass_empty' : 'attach_file'}</span>
               </button>
               <input 
                 value={chatInput}
@@ -1823,6 +1909,11 @@ const App: React.FC = () => {
                   <button onClick={() => { navigator.clipboard?.writeText(messageContextMenu.msg.text); setMessageContextMenu(null); }} className="w-full px-4 py-2 text-left text-[11px] font-bold text-white hover:bg-accent-red/20 flex items-center gap-2">
                     <span className="material-symbols-outlined text-base">content_copy</span> Copy
                   </button>
+                  {messageContextMenu.msg.senderId === currentUserId && (
+                    <button onClick={() => handleDeleteMessage(messageContextMenu.msg)} className="w-full px-4 py-2 text-left text-[11px] font-bold text-vibrant-pink hover:bg-accent-red/20 flex items-center gap-2">
+                      <span className="material-symbols-outlined text-base">delete</span> Delete
+                    </button>
+                  )}
                   <div className="border-t border-white/10 my-1" />
                   <div className="px-3 py-1.5 flex gap-1">
                     {REACTION_EMOJIS.map((emoji) => (
@@ -1841,15 +1932,6 @@ const App: React.FC = () => {
       case 'party':
         return (
           <div className="flex flex-col">
-            <div className="px-6 pb-2 flex justify-between items-center">
-              <h3 className="text-[10px] font-party tracking-[0.2em] text-accent-red uppercase">Vibing Now</h3>
-              <div className="flex items-center gap-2">
-                <button onClick={() => setIsCreatingGroup(true)} className="flex items-center gap-1.5 px-3 py-1 bg-accent-red/10 border border-accent-red/20 rounded-full text-accent-red hover:bg-accent-red hover:text-white transition-all active:scale-95 group">
-                  <span className="material-symbols-outlined text-sm font-bold">group_add</span>
-                  <span className="text-[8px] font-black uppercase tracking-tighter">Create Tribe</span>
-                </button>
-              </div>
-            </div>
             {contactImportError && (
               <div className="px-6 pb-2 text-[10px] text-vibrant-pink uppercase tracking-widest">{contactImportError}</div>
             )}
@@ -1900,32 +1982,79 @@ const App: React.FC = () => {
                   return (
                     <div
                       key={chat.$id}
-                      onClick={() => selectChat(chatUser, false)}
-                      className="flex items-center gap-4 py-2.5 px-3 rounded-xl border border-white/5 hover:bg-white/5 cursor-pointer group transition-colors mb-2"
+                      className="flex items-center gap-3 py-2.5 px-3 rounded-xl border border-white/5 hover:bg-white/5 group transition-colors mb-2 relative"
                     >
-                      <div className="size-10 rounded-full bg-cover border border-accent-red/20 group-hover:border-accent-red/50 transition-all" style={{ backgroundImage: `url(https://picsum.photos/seed/${encodeURIComponent(otherId)}/200)` }} />
-                      <div className="flex-1 min-w-0">
-                        <p className="text-[12px] font-bold text-white truncate">{otherDisplayName}</p>
-                        {chat.lastMessage && <p className="text-[9px] text-gray-500 truncate">{chat.lastMessage}</p>}
+                      <div
+                        className="flex flex-1 min-w-0 items-center gap-3 cursor-pointer"
+                        onClick={() => selectChat(chatUser, false)}
+                      >
+                        <div className="relative shrink-0">
+                          <div className="size-10 rounded-full bg-cover border border-accent-red/20 group-hover:border-accent-red/50 transition-all" style={{ backgroundImage: `url(https://picsum.photos/seed/${encodeURIComponent(otherId)}/200)` }} />
+                          {((chat as any).unreadCounts?.[currentUserId ?? ''] ?? 0) > 0 && (
+                            <span className="absolute -top-0.5 -right-0.5 min-w-[18px] h-[18px] px-1 flex items-center justify-center rounded-full bg-accent-red text-white text-[10px] font-bold">
+                              {Math.min((chat as any).unreadCounts?.[currentUserId ?? ''] ?? 0, 99)}
+                            </span>
+                          )}
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-[12px] font-bold text-white truncate">{otherDisplayName}</p>
+                          {chat.lastMessage && <p className="text-[9px] text-gray-500 truncate">{chat.lastMessage}</p>}
+                        </div>
+                        <span className="material-symbols-outlined text-accent-red/60 text-lg shrink-0">chevron_right</span>
                       </div>
-                      <span className="material-symbols-outlined text-accent-red/60 text-lg">chevron_right</span>
+                      <div className="flex gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
+                        <button type="button" onClick={() => startCall('audio', { id: otherId, name: otherDisplayName, avatar: `https://picsum.photos/seed/${encodeURIComponent(otherId)}/200`, isRoom: false })} className="size-8 rounded-full bg-white/10 flex items-center justify-center text-accent-red hover:bg-accent-red hover:text-white transition-all" title="Voice call">
+                          <span className="material-symbols-outlined text-base">call</span>
+                        </button>
+                        <button type="button" onClick={() => startCall('video', { id: otherId, name: otherDisplayName, avatar: `https://picsum.photos/seed/${encodeURIComponent(otherId)}/200`, isRoom: false })} className="size-8 rounded-full bg-accent-red/20 flex items-center justify-center text-accent-red hover:bg-accent-red hover:text-white transition-all" title="Video call">
+                          <span className="material-symbols-outlined text-base">videocam</span>
+                        </button>
+                      </div>
                     </div>
                   );
                 })}
               </div>
             )}
-            {filteredRooms.length > 0 && (
-              <p className="px-6 pt-4 pb-2 text-[10px] font-party tracking-[0.2em] text-accent-red uppercase">Tribes</p>
-            )}
-            {filteredRooms.map((room) => (
-              <div key={room.id} onClick={() => selectChat(room, true)} className="flex items-center gap-4 px-6 py-3.5 border-b border-white/5 hover:bg-white/5 cursor-pointer group transition-colors">
-                <div className="size-11 rounded-lg bg-cover border border-white/10 group-hover:border-accent-red/50 transition-all group-hover:shadow-[0_0_15px_rgba(255,0,60,0.2)]" style={{ backgroundImage: `url(${room.avatar})` }} />
-                <div className="flex-1 min-w-0">
-                  <div className="flex justify-between items-center"><p className="text-[12px] font-bold text-white truncate">{room.name}</p>{room.isLive && <span className="text-accent-red text-[8px] font-black animate-pulse">LIVE</span>}</div>
-                  <p className="text-[10px] text-gray-500 truncate mt-1"><span className="text-accent-red/70 font-bold">{room.lastSender}:</span> {room.lastMessage}</p>
+            <div className="px-6 pt-4 pb-2 flex justify-between items-center">
+              <p className="text-[10px] font-party tracking-[0.2em] text-accent-red uppercase">Tribes</p>
+              <button onClick={() => setIsCreatingGroup(true)} className="flex items-center gap-1.5 px-3 py-1 bg-accent-red/10 border border-accent-red/20 rounded-full text-accent-red hover:bg-accent-red hover:text-white transition-all active:scale-95">
+                <span className="material-symbols-outlined text-sm font-bold">group_add</span>
+                <span className="text-[8px] font-black uppercase tracking-tighter">Create Tribe</span>
+              </button>
+            </div>
+            {filteredRooms.map((room) => {
+              const roomChat = recentChats.find((c) => c.isRoom && c.$id === room.id);
+              const unread = roomChat ? ((roomChat as any).unreadCounts?.[currentUserId ?? ''] ?? 0) : 0;
+              return (
+                <div key={room.id} className="flex items-center gap-3 px-6 py-3.5 border-b border-white/5 hover:bg-white/5 group transition-colors relative">
+                  <div
+                    className="flex flex-1 min-w-0 items-center gap-4 cursor-pointer"
+                    onClick={() => selectChat(room, true)}
+                  >
+                    <div className="relative shrink-0">
+                      <div className="size-11 rounded-lg bg-cover border border-white/10 group-hover:border-accent-red/50 transition-all group-hover:shadow-[0_0_15px_rgba(255,0,60,0.2)]" style={{ backgroundImage: `url(${room.avatar})` }} />
+                      {unread > 0 && (
+                        <span className="absolute -top-0.5 -right-0.5 min-w-[18px] h-[18px] px-1 flex items-center justify-center rounded-full bg-accent-red text-white text-[10px] font-bold">
+                          {Math.min(unread, 99)}
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex justify-between items-center"><p className="text-[12px] font-bold text-white truncate">{room.name}</p>{room.isLive && <span className="text-accent-red text-[8px] font-black animate-pulse">LIVE</span>}</div>
+                      <p className="text-[10px] text-gray-500 truncate mt-1"><span className="text-accent-red/70 font-bold">{room.lastSender}:</span> {room.lastMessage}</p>
+                    </div>
+                  </div>
+                  <div className="flex gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
+                    <button type="button" onClick={() => startCall('audio', { id: room.id, name: room.name, avatar: room.avatar, isRoom: true })} className="size-8 rounded-full bg-white/10 flex items-center justify-center text-accent-red hover:bg-accent-red hover:text-white transition-all" title="Voice call tribe">
+                      <span className="material-symbols-outlined text-base">call</span>
+                    </button>
+                    <button type="button" onClick={() => startCall('video', { id: room.id, name: room.name, avatar: room.avatar, isRoom: true })} className="size-8 rounded-full bg-accent-red/20 flex items-center justify-center text-accent-red hover:bg-accent-red hover:text-white transition-all" title="Video call tribe">
+                      <span className="material-symbols-outlined text-base">videocam</span>
+                    </button>
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         );
       case 'hotline':
@@ -1949,13 +2078,13 @@ const App: React.FC = () => {
                 <p className="text-[10px] text-accent-red font-bold uppercase tracking-[0.2em] mb-6">Elite Bakchod Legend</p>
                 
                 <div className="grid grid-cols-3 gap-4 w-full">
-                  <button onClick={() => startCall('audio', { id: contact.contactId, name: contact.name, avatar: contact.avatar, isRoom: contact.contactId.startsWith('r-') })} className="flex flex-col items-center gap-2 group">
+                  <button onClick={() => startCall('audio', { id: contact.contactId, name: contact.name, avatar: contact.avatar, isRoom: contact.isRoom ?? contact.contactId.startsWith('r-') })} className="flex flex-col items-center gap-2 group">
                     <div className="size-12 rounded-2xl bg-white/5 border border-white/10 flex items-center justify-center text-accent-red group-hover:bg-accent-red group-hover:text-white transition-all shadow-lg active:scale-95">
                       <span className="material-symbols-outlined">call</span>
                     </div>
                     <span className="text-[8px] font-bold text-gray-500 uppercase tracking-widest">Voice</span>
                   </button>
-                  <button onClick={() => startCall('video', { id: contact.contactId, name: contact.name, avatar: contact.avatar, isRoom: contact.contactId.startsWith('r-') })} className="flex flex-col items-center gap-2 group">
+                  <button onClick={() => startCall('video', { id: contact.contactId, name: contact.name, avatar: contact.avatar, isRoom: contact.isRoom ?? contact.contactId.startsWith('r-') })} className="flex flex-col items-center gap-2 group">
                     <div className="size-12 rounded-2xl bg-accent-red/10 border border-accent-red/20 flex items-center justify-center text-accent-red group-hover:bg-accent-red group-hover:text-white transition-all shadow-[0_0_15px_rgba(255,0,60,0.2)] active:scale-95">
                       <span className="material-symbols-outlined">videocam</span>
                     </div>
@@ -2030,13 +2159,13 @@ const App: React.FC = () => {
                   </div>
                   <div className="flex gap-2">
                     <button 
-                      onClick={(e) => { e.stopPropagation(); startCall('audio', { id: call.contactId, name: call.name, avatar: call.avatar, isRoom: call.contactId.startsWith('r-') }); }}
+                      onClick={(e) => { e.stopPropagation(); startCall('audio', { id: call.contactId, name: call.name, avatar: call.avatar, isRoom: call.isRoom ?? call.contactId.startsWith('r-') }); }}
                       className="size-9 rounded-full bg-white/5 flex items-center justify-center text-accent-red hover:bg-accent-red hover:text-white transition-all active:scale-90"
                     >
                       <span className="material-symbols-outlined text-base">call</span>
                     </button>
                     <button 
-                      onClick={(e) => { e.stopPropagation(); startCall('video', { id: call.contactId, name: call.name, avatar: call.avatar, isRoom: call.contactId.startsWith('r-') }); }}
+                      onClick={(e) => { e.stopPropagation(); startCall('video', { id: call.contactId, name: call.name, avatar: call.avatar, isRoom: call.isRoom ?? call.contactId.startsWith('r-') }); }}
                       className="size-9 rounded-full bg-accent-red/10 flex items-center justify-center text-accent-red hover:bg-accent-red hover:text-white transition-all active:scale-90"
                     >
                       <span className="material-symbols-outlined text-base">videocam</span>
@@ -2189,20 +2318,6 @@ const App: React.FC = () => {
             </div>
           </form>
         </div>
-      )}
-
-      {!activeChat && !isCreatingGroup && !isSettingsOpen && (
-        <StoryBar
-          searchQuery={activeTab === 'party' || activeTab === 'hotline' ? searchQuery : ""}
-          users={storyBarUsers}
-          onSelectUser={(user) => {
-          if ((user as User & { isRoom?: boolean }).isRoom) {
-            selectChat(user, true);
-          } else {
-            void handleSelectContact(user);
-          }
-        }}
-        />
       )}
 
       <main className={`flex-1 overflow-y-auto no-scrollbar ${!activeChat && !isSettingsOpen ? 'pb-28' : 'pb-0'}`}>

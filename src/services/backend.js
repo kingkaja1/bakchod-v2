@@ -189,8 +189,13 @@ export function subscribeMessages(chatId, callback) {
 }
 
 export async function createMessage(input) {
-  const batch = writeBatch(db);
   const chatRef = doc(db, 'chats', input.chatId);
+  const chatSnap = await getDoc(chatRef);
+  const chatData = chatSnap.exists() ? chatSnap.data() : {};
+  const participantIds = chatData.participantIds || [];
+  const existingUnread = chatData.unreadCounts || {};
+
+  const batch = writeBatch(db);
   const messagesRef = collection(db, 'chats', input.chatId, 'messages');
   const messageRef = doc(messagesRef);
   const msgData = {
@@ -217,8 +222,79 @@ export async function createMessage(input) {
     updateData.lastSender = input.userId;
     updateData.lastSenderDisplayName = input.lastSenderDisplayName;
   }
+  // Bump unread count for all participants except sender
+  participantIds.forEach((uid) => {
+    if (uid && uid !== input.userId) {
+      updateData[`unreadCounts.${uid}`] = (existingUnread[uid] ?? 0) + 1;
+    }
+  });
   batch.update(chatRef, updateData);
   await batch.commit();
+}
+
+/** Upload a file (image, video, or doc) for a chat message. Returns the download URL. */
+export async function uploadChatFile(chatId, userId, file) {
+  const safeName = (file.name || 'file').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80);
+  const path = `chatMedia/${chatId}/${userId}_${Date.now()}_${safeName}`;
+  const storageRef = ref(storage, path);
+  await uploadBytes(storageRef, file, { contentType: file.type || 'application/octet-stream' });
+  return getDownloadURL(storageRef);
+}
+
+/** Delete a single message. Only the sender or chat participants can delete. */
+export async function deleteMessage(chatId, messageId) {
+  const msgRef = doc(db, 'chats', chatId, 'messages', messageId);
+  await deleteDoc(msgRef);
+}
+
+/** Clear all messages in a chat. Leaves the chat doc intact. */
+export async function clearChat(chatId) {
+  const messagesRef = collection(db, 'chats', chatId, 'messages');
+  const snapshot = await getDocs(query(messagesRef, limit(500)));
+  const batchSize = 500;
+  if (snapshot.empty) return;
+  let batch = writeBatch(db);
+  let count = 0;
+  for (const docSnap of snapshot.docs) {
+    batch.delete(docSnap.ref);
+    count++;
+    if (count === batchSize) {
+      await batch.commit();
+      batch = writeBatch(db);
+      count = 0;
+    }
+  }
+  if (count > 0) await batch.commit();
+  const chatRef = doc(db, 'chats', chatId);
+  const chatSnap = await getDoc(chatRef);
+  const chatData = chatSnap.exists() ? chatSnap.data() : {};
+  const participantIds = chatData.participantIds || [];
+  const unreadCounts = {};
+  participantIds.forEach((uid) => {
+    if (uid) unreadCounts[uid] = 0;
+  });
+  await updateDoc(chatRef, {
+    lastMessage: null,
+    lastMessageAt: null,
+    lastSender: null,
+    lastSenderDisplayName: null,
+    unreadCounts,
+    updatedAt: serverTimestamp(),
+  });
+}
+
+/** Mark a chat as read for a user (reset unread count). */
+export async function markChatRead(chatId, userId) {
+  const chatRef = doc(db, 'chats', chatId);
+  const snap = await getDoc(chatRef);
+  if (!snap.exists()) return;
+  const data = snap.data();
+  const unreadCounts = { ...(data.unreadCounts || {}) };
+  unreadCounts[userId] = 0;
+  await updateDoc(chatRef, {
+    unreadCounts,
+    updatedAt: serverTimestamp(),
+  });
 }
 
 export async function addMessageReaction(chatId, messageId, userId, emoji) {
@@ -292,8 +368,18 @@ export async function updateInviteStatus(inviteId, status) {
   return updateDoc(doc(db, 'invites', inviteId), { status });
 }
 
-export function subscribeInvites(callback) {
-  return onSnapshot(collection(db, 'invites'), callback);
+export function subscribeInvites(userId, callback) {
+  if (!userId || !db) {
+    callback({ docs: [] });
+    return () => {};
+  }
+  const q = query(
+    collection(db, 'invites'),
+    where('targetType', '==', 'userId'),
+    where('targetValue', '==', userId),
+    limit(100)
+  );
+  return onSnapshot(q, callback);
 }
 
 export async function generateRoastWithFunction(context) {

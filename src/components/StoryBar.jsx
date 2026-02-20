@@ -1,6 +1,6 @@
 import { useMemo } from 'react';
 
-function StoryBar({ searchQuery = '', users, onSelectUser }) {
+function StoryBar({ searchQuery = '', users, onSelectUser, onStartCall }) {
   const filteredUsers = useMemo(() => {
     if (!searchQuery) return users;
     return users.filter((user) =>
@@ -17,7 +17,7 @@ function StoryBar({ searchQuery = '', users, onSelectUser }) {
             onClick={() => onSelectUser(user)}
             className="flex flex-col items-center gap-1 w-12 text-center group cursor-pointer shrink-0"
           >
-            <div className="relative">
+            <div className="relative cursor-pointer" onClick={() => onSelectUser(user)}>
               <div
                 className={`w-11 h-11 bg-center bg-no-repeat aspect-square bg-cover rounded-full border-2 p-0.5 transition-all group-hover:scale-105 active:scale-90 ${
                   user.status === 'vibing'
@@ -39,10 +39,21 @@ function StoryBar({ searchQuery = '', users, onSelectUser }) {
                 <div className="absolute bottom-0.5 right-0.5 size-2 rounded-full bg-green-500 border border-night-black" />
               )}
             </div>
+            {user.id !== '1' && onStartCall && (
+              <div className="flex gap-0.5 mt-0.5">
+                <button type="button" onClick={(e) => { e.stopPropagation(); onStartCall(user, 'audio'); }} className="size-6 rounded-full bg-white/10 flex items-center justify-center text-accent-red hover:bg-accent-red hover:text-white transition-all" title="Voice call">
+                  <span className="material-symbols-outlined text-xs">call</span>
+                </button>
+                <button type="button" onClick={(e) => { e.stopPropagation(); onStartCall(user, 'video'); }} className="size-6 rounded-full bg-accent-red/20 flex items-center justify-center text-accent-red hover:bg-accent-red hover:text-white transition-all" title="Video call">
+                  <span className="material-symbols-outlined text-xs">videocam</span>
+                </button>
+              </div>
+            )}
             <p
-              className={`text-[8px] font-bold tracking-tight truncate w-full uppercase ${
+              className={`text-[8px] font-bold tracking-tight truncate w-full uppercase cursor-pointer ${
                 user.status === 'offline' ? 'text-gray-500' : 'text-white'
               }`}
+              onClick={() => onSelectUser(user)}
             >
               {user.name}
             </p>
