@@ -1,0 +1,131 @@
+.auth-container {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px 20px;
+  font-family: 'Plus Jakarta Sans', system-ui, sans-serif;
+  overflow-y: auto;
+}
+
+.auth-card {
+  background: rgba(17, 2, 33, 0.85);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 0, 60, 0.25);
+  border-radius: 24px;
+  padding: 32px 24px;
+  width: 100%;
+  max-width: 360px;
+  box-shadow: 0 0 30px rgba(255, 0, 60, 0.15), 0 10px 40px rgba(0, 0, 0, 0.5);
+}
+
+.auth-header {
+  text-align: center;
+  margin-bottom: 32px;
+}
+
+.auth-header h1 {
+  font-family: 'Bungee', cursive;
+  font-size: 28px;
+  font-weight: 400;
+  color: #ff003c;
+  margin: 0 0 8px;
+  text-shadow: 0 0 10px rgba(255, 0, 60, 0.5);
+  letter-spacing: 0.1em;
+}
+
+.auth-header p {
+  font-size: 12px;
+  color: #8696a0;
+  margin: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+}
+
+.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.auth-form input {
+  padding: 14px 16px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 2px solid rgba(255, 0, 60, 0.3);
+  border-radius: 12px;
+  font-size: 15px;
+  color: #fff;
+  outline: none;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.auth-form input:focus {
+  border-color: #ff003c;
+  box-shadow: 0 0 15px rgba(255, 0, 60, 0.2);
+}
+
+.auth-form input::placeholder {
+  color: #667781;
+}
+
+.auth-error {
+  padding: 12px;
+  background: rgba(255, 0, 96, 0.15);
+  color: #ff2d55;
+  border: 1px solid rgba(255, 0, 96, 0.3);
+  border-radius: 12px;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.auth-btn {
+  padding: 14px;
+  background: #ff003c;
+  color: #fff;
+  border: none;
+  border-radius: 12px;
+  font-size: 15px;
+  font-weight: 600;
+  font-family: 'Bungee', cursive;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 0.2s, box-shadow 0.2s;
+  box-shadow: 0 4px 20px rgba(255, 0, 60, 0.4);
+}
+
+.auth-btn:hover:not(:disabled) {
+  background: #e60038;
+  box-shadow: 0 6px 25px rgba(255, 0, 60, 0.5);
+}
+
+.auth-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.auth-toggle {
+  text-align: center;
+  margin-top: 24px;
+  font-size: 13px;
+  color: #667781;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.auth-link {
+  background: none;
+  border: none;
+  color: #ff003c;
+  cursor: pointer;
+  font-size: 13px;
+  text-decoration: underline;
+  padding: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.auth-link:hover {
+  color: #ff2d55;
+}

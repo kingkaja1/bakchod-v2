@@ -1,0 +1,72 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  box-sizing: border-box;
+}
+
+:root {
+  font-family: 'Plus Jakarta Sans', system-ui, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  @apply bg-night-black text-white selection:bg-accent-red selection:text-white;
+}
+
+#root {
+  width: 100%;
+  min-height: 100vh;
+}
+
+/* Bakchod-main styles */
+.neon-frame {
+  border: 4px solid #ff003c;
+  box-shadow:
+    inset 0 0 15px rgba(255, 0, 60, 0.6),
+    inset 0 0 5px rgba(255, 255, 255, 0.3),
+    0 0 15px rgba(255, 0, 60, 0.6),
+    0 0 30px rgba(255, 0, 60, 0.4);
+}
+
+.neon-text {
+  text-shadow: 0 0 10px rgba(255, 0, 60, 0.8), 0 0 20px rgba(255, 0, 60, 0.4);
+}
+
+.glass-card {
+  background: rgba(17, 2, 33, 0.7);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 0, 60, 0.2);
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+.vibe-gradient {
+  background: radial-gradient(circle at 50% 0%, #2a0505 0%, #05010a 100%);
+}
+
+.animate-vibe {
+  animation: pulse-glow 2s infinite;
+}
+
+@keyframes pulse-glow {
+  0%,
+  100% {
+    box-shadow: 0 0 15px rgba(255, 0, 60, 0.4);
+  }
+  50% {
+    box-shadow: 0 0 30px rgba(255, 0, 60, 0.8);
+  }
+}
