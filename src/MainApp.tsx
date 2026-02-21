@@ -3,13 +3,22 @@ import React, { useState, useMemo, useCallback, useEffect, useRef } from 'react'
 import Layout from './components/Layout';
 import { generateRoast } from './services/geminiService';
 import { auth, db, functions } from './services/firebaseClient';
+import { updateProfile as authUpdateProfile } from 'firebase/auth';
 import { httpsCallable } from 'firebase/functions';
 import { collection, doc, getDoc, getDocs, limit, query, where } from 'firebase/firestore';
 import {
   ensureProfile,
   getOrCreateChat,
   createRoom,
+  getRoomDetails,
+  addRoomMembers,
+  removeRoomMember,
+  updateRoomAdmin,
+  uploadProfilePhoto,
+  getUserAvatarUrl,
+  uploadGroupAvatar,
   subscribeMessages,
+  subscribeToChatDoc,
   subscribeToUserChats,
   createMessage,
   addMessageReaction,
@@ -29,9 +38,17 @@ import {
   deleteMessage as deleteMessageBackend,
   clearChat as clearChatBackend,
   markChatRead,
+  getChatMute,
+  setChatMute,
   uploadChatFile,
+  createCall,
+  updateCallStatus,
+  subscribeToCallStatus,
+  subscribeToIncomingCalls,
 } from './services/backend';
 import { User, ActiveRoom, Message } from './types';
+import { registerForPushNotifications, isPushSupported } from './services/pushNotifications';
+import JitsiCallView from './components/JitsiCallView';
 import { useUserContext } from './contexts/UserContext';
 import { useAuth } from './context/AuthContext';
 
@@ -284,12 +301,28 @@ const App: React.FC = () => {
   const [typingIndicators, setTypingIndicators] = useState<Array<{ userId: string; displayName?: string }>>([]);
   const [messageContextMenu, setMessageContextMenu] = useState<{ msg: Message; x: number; y: number } | null>(null);
   const [chatMenuOpen, setChatMenuOpen] = useState(false);
+  const [groupInfoOpen, setGroupInfoOpen] = useState(false);
+  const [groupInfoData, setGroupInfoData] = useState<{ $id: string; name: string; ownerId: string; participantIds: string[]; participantData: Record<string, { displayName?: string }>; adminIds: string[]; avatarUrl?: string | null } | null>(null);
+  const [groupInfoLoading, setGroupInfoLoading] = useState(false);
+  const [groupAddMemberOpen, setGroupAddMemberOpen] = useState(false);
+  const [chatLastReadAt, setChatLastReadAt] = useState<Record<string, Record<string, Date>>>({});
+  const [chatSearchQuery, setChatSearchQuery] = useState('');
+  const [mutedChats, setMutedChats] = useState<Record<string, boolean>>({});
+  const [avatarPreview, setAvatarPreview] = useState<{ url: string; name?: string } | null>(null);
+  const groupAvatarInputRef = useRef<HTMLInputElement>(null);
   const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const typingUnsubRef = useRef<(() => void) | null>(null);
+  const chatDocUnsubRef = useRef<(() => void) | null>(null);
   
   // Call States
   const [isCalling, setIsCalling] = useState(false);
   const [callMode, setCallMode] = useState<CallMode>(null);
+  const [activeCallDoc, setActiveCallDoc] = useState<{ $id: string; roomName: string; fromDisplayName?: string; mode: 'audio' | 'video'; status: string } | null>(null);
+  const [incomingCall, setIncomingCall] = useState<{ $id: string; fromDisplayName?: string; mode: string; roomName: string } | null>(null);
+  const [callDeclined, setCallDeclined] = useState(false);
+  const [outgoingCallId, setOutgoingCallId] = useState<string | null>(null);
+  const callStatusUnsubRef = useRef<(() => void) | null>(null);
+  const incomingCallsUnsubRef = useRef<(() => void) | null>(null);
   
   // Input & Search
   const [searchQuery, setSearchQuery] = useState("");
@@ -310,8 +343,10 @@ const App: React.FC = () => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const chatAttachRef = useRef<HTMLInputElement>(null);
   const [isUploadingMedia, setIsUploadingMedia] = useState(false);
+  const [isRecordingVoice, setIsRecordingVoice] = useState(false);
   const [stream, setStream] = useState<MediaStream | null>(null);
   const activeChatUnsubscribeRef = useRef<null | (() => void)>(null);
+  const voiceRecorderRef = useRef<{ recorder: MediaRecorder; chunks: Blob[] } | null>(null);
 
   // AI Content State
   const [currentRoast, setCurrentRoast] = useState("Type something to get roasted! 🌶️");
@@ -450,6 +485,26 @@ const App: React.FC = () => {
     return () => unsubscribe();
   }, [currentUserId]);
 
+  // Prefetch avatars for visible users (chats, contacts, group)
+  useEffect(() => {
+    const uids = new Set<string>();
+    recentChats.forEach((c) => c.participantIds?.forEach((p) => uids.add(p)));
+    contacts.forEach((c) => {
+      if (c.appUserId) uids.add(c.appUserId);
+      if (c.onBakchod && c.id && !c.id.startsWith('c-') && !c.id.startsWith('phone:')) uids.add(c.id);
+    });
+    if (groupInfoData?.participantIds) groupInfoData.participantIds.forEach((p) => uids.add(p));
+    uids.delete(currentUserId || '');
+    const toFetch = [...uids].filter((uid) => !userAvatarCache[uid]);
+    if (toFetch.length === 0) return;
+    let cancelled = false;
+    toFetch.forEach(async (uid) => {
+      const url = await getUserAvatarUrl(uid);
+      if (!cancelled && url) setUserAvatarCache((prev) => ({ ...prev, [uid]: url }));
+    });
+    return () => { cancelled = true; };
+  }, [recentChats, contacts, groupInfoData, currentUserId]);
+
   // Search registered users by display name (Party tab)
   useEffect(() => {
     if (activeTab !== 'party' || !currentUserId) {
@@ -474,8 +529,15 @@ const App: React.FC = () => {
     return () => clearTimeout(timer);
   }, [searchQuery, activeTab, currentUserId]);
 
+  // Populate avatar cache from search results (they include photoURL)
   useEffect(() => {
-    if (!isCreatingGroup || !tribeMemberSearch.trim() || !currentUserId) {
+    const updates: Record<string, string> = {};
+    [...searchedUsers, ...tribeSearchedUsers].forEach((u) => { if (u.id && (u as any).photoURL) updates[u.id] = (u as any).photoURL; });
+    if (Object.keys(updates).length > 0) setUserAvatarCache((prev) => ({ ...prev, ...updates }));
+  }, [searchedUsers, tribeSearchedUsers]);
+
+  useEffect(() => {
+    if ((!isCreatingGroup && !groupAddMemberOpen) || !tribeMemberSearch.trim() || !currentUserId) {
       setTribeSearchedUsers([]);
       return;
     }
@@ -488,7 +550,7 @@ const App: React.FC = () => {
       }
     }, 300);
     return () => clearTimeout(timer);
-  }, [tribeMemberSearch, isCreatingGroup, currentUserId]);
+  }, [tribeMemberSearch, isCreatingGroup, groupAddMemberOpen, currentUserId]);
 
   useEffect(() => {
     if (!appUser) return;
@@ -557,7 +619,7 @@ const App: React.FC = () => {
         lastMessage: c.lastMessage || '',
         lastSender: (c as any).lastSenderDisplayName || '',
         isLive: false,
-        avatar: `https://picsum.photos/seed/${encodeURIComponent(c.name || c.$id)}/200`,
+        avatar: (c as any).avatarUrl || `https://picsum.photos/seed/${encodeURIComponent(c.name || c.$id)}/200`,
       }));
     const fromState = rooms.filter(
       (r) => !recentChats.some((c) => c.$id === r.id)
@@ -754,6 +816,7 @@ const App: React.FC = () => {
           timestamp: createdAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
           type: doc.type || 'text',
           imageUrl: doc.imageUrl || undefined,
+          audioUrl: doc.audioUrl || undefined,
           replyTo: doc.replyTo || undefined,
           reactions: doc.reactions || {},
           createdAt,
@@ -761,6 +824,24 @@ const App: React.FC = () => {
       });
       setChatMessages(prev => ({ ...prev, [chatId]: mapped }));
     });
+    if (chatDocUnsubRef.current) chatDocUnsubRef.current();
+    chatDocUnsubRef.current = subscribeToChatDoc(firestoreChatId, (chatData: any) => {
+      const lastReadAt = chatData.lastReadAt || {};
+      const byUser: Record<string, Date> = {};
+      Object.keys(lastReadAt).forEach((uid) => {
+        const v = lastReadAt[uid];
+        if (v) byUser[uid] = toDate(v);
+      });
+      setChatLastReadAt(prev => ({ ...prev, [chatId]: byUser }));
+    });
+    if (isRoom) {
+      getRoomDetails(firestoreChatId).then((data) => {
+        if (data) setGroupInfoData((prev) => (prev?.$id === data.$id ? prev : data));
+      }).catch(() => {});
+    }
+    getChatMute(currentUserId, firestoreChatId).then((muted) => {
+      setMutedChats((prev) => ({ ...prev, [chatId]: muted }));
+    }).catch(() => {});
     if (typingUnsubRef.current) typingUnsubRef.current();
     typingUnsubRef.current = subscribeTyping(firestoreChatId, (typers) => {
       setTypingIndicators(typers.filter((t) => t.userId !== currentUserId));
@@ -772,6 +853,10 @@ const App: React.FC = () => {
     if (activeChatUnsubscribeRef.current) {
       activeChatUnsubscribeRef.current();
       activeChatUnsubscribeRef.current = null;
+    }
+    if (chatDocUnsubRef.current) {
+      chatDocUnsubRef.current();
+      chatDocUnsubRef.current = null;
     }
     if (typingUnsubRef.current) {
       typingUnsubRef.current();
@@ -785,9 +870,24 @@ const App: React.FC = () => {
       activeChatUnsubscribeRef.current();
       activeChatUnsubscribeRef.current = null;
     }
+    if (chatDocUnsubRef.current) {
+      chatDocUnsubRef.current();
+      chatDocUnsubRef.current = null;
+    }
     if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
     if (typingUnsubRef.current) typingUnsubRef.current();
   }, []);
+
+  useEffect(() => {
+    if (!currentUserId || activeCallDoc) return;
+    incomingCallsUnsubRef.current = subscribeToIncomingCalls(currentUserId, (calls) => {
+      const first = calls[0];
+      setIncomingCall(first ? { $id: first.$id, fromDisplayName: first.fromDisplayName, mode: first.mode || 'video', roomName: first.roomName } : null);
+    });
+    return () => {
+      if (incomingCallsUnsubRef.current) { incomingCallsUnsubRef.current(); incomingCallsUnsubRef.current = null; }
+    };
+  }, [currentUserId, activeCallDoc]);
 
   useEffect(() => {
     if (!activeChat || !currentUserId) return;
@@ -808,8 +908,8 @@ const App: React.FC = () => {
     };
   }, [chatInput, activeChat, currentUserId, displayName, chatDocIds]);
 
-  const handleSendMessage = async (text: string, type: 'text' | 'image' | 'video' | 'file' | 'roast' = 'text', options?: { imageUrl?: string; fileName?: string }) => {
-    const mediaUrl = options?.imageUrl;
+  const handleSendMessage = async (text: string, type: 'text' | 'image' | 'video' | 'file' | 'audio' | 'roast' = 'text', options?: { imageUrl?: string; fileName?: string; audioUrl?: string }) => {
+    const mediaUrl = options?.imageUrl ?? options?.audioUrl;
     const hasContent = (text && text.trim()) || mediaUrl;
     if (!hasContent || !activeChat) return;
     const selectedContact = contacts.find((c) => c.id === activeChat.id || c.appUserId === activeChat.id);
@@ -841,7 +941,7 @@ const App: React.FC = () => {
     }
 
     const contentLabel = mediaUrl
-      ? (type === 'image' ? 'Photo' : type === 'video' ? 'Video' : type === 'file' ? (options?.fileName || 'File') : text)
+      ? (type === 'image' ? 'Photo' : type === 'video' ? 'Video' : type === 'file' ? (options?.fileName || 'File') : type === 'audio' ? 'Voice message' : text)
       : text;
     const now = new Date();
     const userMsg: Message = {
@@ -851,7 +951,9 @@ const App: React.FC = () => {
       text: contentLabel,
       timestamp: now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       type,
-      ...(mediaUrl && { imageUrl: mediaUrl }),
+      ...(options?.imageUrl && { imageUrl: options.imageUrl }),
+      ...(options?.audioUrl && { audioUrl: options.audioUrl }),
+      ...(mediaUrl && type !== 'audio' && { imageUrl: mediaUrl }),
       replyTo: replyToMessage ? { messageId: replyToMessage.id, text: replyToMessage.text, senderName: replyToMessage.senderName } : undefined,
       createdAt: now,
     };
@@ -883,7 +985,8 @@ const App: React.FC = () => {
           content: contentLabel,
           language: preferredLanguage,
           type,
-          imageUrl: mediaUrl || undefined,
+          imageUrl: options?.imageUrl || (type !== 'audio' ? mediaUrl : undefined) || undefined,
+          audioUrl: options?.audioUrl || undefined,
           senderDisplayName: displayName || 'You',
           lastSenderDisplayName: activeChat.isRoom ? (displayName || 'You') : undefined,
           replyTo: replyToMessage ? { messageId: replyToMessage.id, text: replyToMessage.text.slice(0, 100), senderName: replyToMessage.senderName } : undefined,
@@ -908,14 +1011,78 @@ const App: React.FC = () => {
     }
   };
 
-  const handleAvatarChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const toggleVoiceRecording = async () => {
+    if (!activeChat || !currentUserId) return;
+    if (isRecordingVoice && voiceRecorderRef.current) {
+      const { recorder, chunks } = voiceRecorderRef.current;
+      recorder.stop();
+      voiceRecorderRef.current = null;
+      setIsRecordingVoice(false);
+      stream?.getTracks().forEach((t) => t.stop());
+      setStream(null);
+      if (chunks.length === 0) return;
+      const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+      const file = new File([blob], `voice_${Date.now()}.webm`, { type: blob.type });
+      const firestoreChatId = chatDocIds[activeChat.id] ?? (await getOrCreateChat({ userId: currentUserId, externalId: activeChat.id, name: activeChat.name, isRoom: activeChat.isRoom, currentUserDisplayName: displayName })).$id;
+      if (!chatDocIds[activeChat.id]) setChatDocIds(prev => ({ ...prev, [activeChat.id]: firestoreChatId }));
+      setIsUploadingMedia(true);
+      try {
+        const url = await uploadChatFile(firestoreChatId, currentUserId, file);
+        await handleSendMessage('Voice message', 'audio', { audioUrl: url });
+      } catch (err: any) {
+        window.alert(err?.message || 'Failed to send voice message.');
+      } finally {
+        setIsUploadingMedia(false);
+      }
+      return;
+    }
+    try {
+      const mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      setStream(mediaStream);
+      const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm';
+      const recorder = new MediaRecorder(mediaStream, { mimeType: mime });
+      const chunks: Blob[] = [];
+      recorder.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+      recorder.start(200);
+      voiceRecorderRef.current = { recorder, chunks };
+      setIsRecordingVoice(true);
+    } catch (err: any) {
+      window.alert(err?.message || 'Microphone access needed for voice messages.');
+    }
+  };
+
+  const [profilePicUploading, setProfilePicUploading] = useState(false);
+  const [userAvatarCache, setUserAvatarCache] = useState<Record<string, string>>({});
+  const getAvatarUrl = (uid: string) =>
+    uid === currentUserId ? userAvatar : (userAvatarCache[uid] || `https://picsum.photos/seed/${encodeURIComponent(uid)}/200`);
+  const handleAvatarChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        setUserAvatar(reader.result as string);
-      };
-      reader.readAsDataURL(file);
+    e.target.value = '';
+    if (!currentUserId) {
+      window.alert('Please sign in to update your profile photo.');
+      return;
+    }
+    if (!file) return;
+    setProfilePicUploading(true);
+    try {
+      const url = await uploadProfilePhoto(currentUserId, file);
+      setUserAvatar(url);
+      setUserAvatarCache((prev) => ({ ...prev, [currentUserId]: url }));
+      if (auth.currentUser) {
+        await authUpdateProfile(auth.currentUser, { photoURL: url });
+      }
+      try {
+        await updateUserProfileCallable({ displayName: displayName || 'You', photoURL: url });
+      } catch {
+        // Cloud Function may not be deployed
+      }
+    } catch (err: any) {
+      const code = err?.code || err?.message || '';
+      const msg = err?.message || 'Unknown error';
+      console.error('Profile photo upload failed:', { code, msg, err });
+      window.alert(`Failed to update profile photo: ${msg}${code ? ` (${code})` : ''}`);
+    } finally {
+      setProfilePicUploading(false);
     }
   };
 
@@ -1244,15 +1411,38 @@ const App: React.FC = () => {
     );
   };
 
-  const startCall = (mode: CallMode, contactOverride?: { id: string, name: string, avatar: string, isRoom: boolean }) => {
+  const startCall = async (mode: CallMode, contactOverride?: { id: string, name: string, avatar: string, isRoom: boolean }) => {
     const target = contactOverride || activeChat;
-    if (!target) return;
+    if (!target || !currentUserId) return;
 
+    let targetParticipantIds: string[] = [];
+    if (target.isRoom) {
+      const fid = chatDocIds[target.id] || target.id;
+      try {
+        const chatSnap = await getDoc(doc(db, 'chats', fid));
+        const pids = chatSnap.exists() ? (chatSnap.data().participantIds || []) : [];
+        targetParticipantIds = pids.filter((id: string) => id !== currentUserId);
+      } catch {
+        targetParticipantIds = [];
+      }
+    } else {
+      const peerUid = contacts.find((c) => c.id === target.id || c.appUserId === target.id)?.appUserId || target.id;
+      if (!peerUid || peerUid === currentUserId) {
+        window.alert('Cannot call: contact must be on Bakchod and different from you.');
+        return;
+      }
+      targetParticipantIds = [peerUid];
+    }
+    if (targetParticipantIds.length === 0 && target.isRoom) {
+      window.alert('No other participants in this tribe.');
+      return;
+    }
+
+    setCallDeclined(false);
     setIsCalling(true);
     setCallMode(mode);
     setIsCameraOff(mode === 'audio');
-    
-    // Add to history
+
     const newHistoryItem: CallHistoryItem = {
       id: `h-${Date.now()}`,
       name: target.name,
@@ -1264,13 +1454,45 @@ const App: React.FC = () => {
       isRoom: target.isRoom ?? false,
     };
     setCallHistory(prev => [newHistoryItem, ...prev]);
+    if (!activeChat) setActiveChat({ id: target.id, name: target.name, avatar: target.avatar, isRoom: target.isRoom });
 
-    if (!activeChat) {
-      setActiveChat({ id: target.id, name: target.name, avatar: target.avatar, isRoom: target.isRoom });
+    try {
+      const { callId, roomName } = await createCall({
+        fromUserId: currentUserId,
+        fromDisplayName: displayName || 'You',
+        targetParticipantIds,
+        targetChatId: target.isRoom ? target.id : undefined,
+        isRoom: target.isRoom,
+        mode: mode || 'video',
+      });
+      setOutgoingCallId(callId);
+      if (callStatusUnsubRef.current) callStatusUnsubRef.current();
+      callStatusUnsubRef.current = subscribeToCallStatus(callId, (doc) => {
+        if (doc.status === 'accepted') {
+          setActiveCallDoc({ $id: callId, roomName: doc.roomName || roomName, fromDisplayName: target.name, mode: mode || 'video', status: 'accepted' });
+        } else if (doc.status === 'declined') {
+          setCallDeclined(true);
+          setIsCalling(false);
+          setCallMode(null);
+          setOutgoingCallId(null);
+          if (callStatusUnsubRef.current) { callStatusUnsubRef.current(); callStatusUnsubRef.current = null; }
+        }
+      });
+    } catch (err: any) {
+      window.alert(err?.message || 'Failed to start call.');
+      setIsCalling(false);
+      setCallMode(null);
     }
   };
 
-  const handleEndCall = () => {
+  const handleEndCall = async () => {
+    const callId = activeCallDoc?.$id || outgoingCallId;
+    if (callId) {
+      try { await updateCallStatus(callId, activeCallDoc ? 'ended' : 'cancelled'); } catch {}
+    }
+    setActiveCallDoc(null);
+    setOutgoingCallId(null);
+    if (callStatusUnsubRef.current) { callStatusUnsubRef.current(); callStatusUnsubRef.current = null; }
     setCallEnded(true);
     setIsCalling(false);
     setCallMode(null);
@@ -1279,6 +1501,27 @@ const App: React.FC = () => {
       setStream(null);
     }
     setTimeout(() => setCallEnded(false), 2000);
+  };
+
+  const handleAcceptCall = async () => {
+    if (!incomingCall || !currentUserId) return;
+    const callId = incomingCall.$id;
+    const mode = (incomingCall.mode as 'audio' | 'video') || 'video';
+    try {
+      await updateCallStatus(callId, 'accepted');
+      setActiveCallDoc({ $id: callId, roomName: incomingCall.roomName, fromDisplayName: incomingCall.fromDisplayName, mode, status: 'accepted' });
+      setIncomingCall(null);
+      setIsCalling(true);
+      setCallMode(mode);
+    } catch (err: any) {
+      window.alert(err?.message || 'Failed to accept.');
+    }
+  };
+
+  const handleDeclineCall = async () => {
+    if (!incomingCall) return;
+    try { await updateCallStatus(incomingCall.$id, 'declined'); } catch {}
+    setIncomingCall(null);
   };
 
   const SettingsItem: React.FC<{ icon: string; title: string; subtitle?: string; onClick: () => void; isLast?: boolean }> = ({ icon, title, subtitle, onClick, isLast }) => (
@@ -1416,7 +1659,7 @@ const App: React.FC = () => {
                     onClick={() => { setActiveSettingCategory(null); setIsSettingsOpen(false); void handleSelectContact(contact); }}
                     className="flex items-center gap-3 p-3 rounded-xl border bg-white/5 border-white/10 cursor-pointer hover:bg-white/10 transition-colors"
                   >
-                    <div className="size-10 rounded-lg bg-cover border border-white/10" style={{ backgroundImage: `url(${contact.avatar})` }} />
+                    <div className="size-10 rounded-full bg-center bg-cover border border-white/10 overflow-hidden shrink-0" style={{ backgroundImage: `url(${contact.appUserId ? getAvatarUrl(contact.appUserId) : contact.avatar})` }} />
                     <div className="flex-1 min-w-0">
                       <p className="text-[12px] font-bold text-white truncate">{contact.name}</p>
                       <p className="text-[9px] text-gray-500 uppercase tracking-widest">
@@ -1483,12 +1726,19 @@ const App: React.FC = () => {
         </div>
 
         <div className="p-4 flex items-center gap-4 bg-accent-red/5 border-b border-white/5">
-          <div className="size-16 rounded-full border-2 border-accent-red p-1">
+          <div
+            onClick={() => setAvatarPreview({ url: userAvatar, name: displayName })}
+            className="size-16 rounded-full border-2 border-accent-red p-1 shrink-0 cursor-pointer block overflow-hidden"
+          >
             <img src={userAvatar} className="w-full h-full rounded-full object-cover" alt="avatar" />
           </div>
-          <div>
+          <div className="flex-1 min-w-0">
             <p className="text-base font-bold text-white">{displayName}</p>
             <p className="text-[10px] text-accent-red font-bold uppercase tracking-widest">Level 99 Legend</p>
+            <label className={`mt-2 inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-[10px] font-bold cursor-pointer transition-all ${profilePicUploading ? 'opacity-50' : 'bg-white/10 hover:bg-white/15 text-white'}`}>
+              <input type="file" className="sr-only" accept="image/*" onChange={handleAvatarChange} disabled={profilePicUploading} />
+              {profilePicUploading ? 'Uploading...' : 'Change photo'}
+            </label>
           </div>
         </div>
 
@@ -1630,7 +1880,23 @@ const App: React.FC = () => {
     }
 
     if (activeChat) {
-      const messages = chatMessages[activeChat.id] || [];
+      const messagesLoaded = activeChat.id in chatMessages;
+      const rawMessages = chatMessages[activeChat.id] || [];
+      const chatSearch = (chatSearchQuery || '').trim().toLowerCase();
+      const messages = chatSearch
+        ? rawMessages.filter((m) => (m.text || '').toLowerCase().includes(chatSearch))
+        : rawMessages;
+      const lastReadByChat = chatLastReadAt[activeChat.id] || {};
+      const otherUserIds = activeChat.isRoom
+        ? (groupInfoData?.participantIds || []).filter((id) => id !== currentUserId)
+        : Object.keys(lastReadByChat).filter((id) => id !== currentUserId);
+      const isRead = (msg: Message) => {
+        if (msg.senderId !== currentUserId || !msg.createdAt) return false;
+        return otherUserIds.some((uid) => {
+          const t = lastReadByChat[uid];
+          return t && t.getTime() >= msg.createdAt!.getTime();
+        });
+      };
       return (
         <div className="flex-1 flex flex-col h-full bg-night-black">
           {/* Contact Header */}
@@ -1644,11 +1910,46 @@ const App: React.FC = () => {
             }} className="p-1 text-white/40 hover:text-white shrink-0">
               <span className="material-symbols-outlined text-xl">chevron_left</span>
             </button>
-            <div className="size-8 rounded-lg bg-center bg-cover border border-accent-red/20 shrink-0" style={{ backgroundImage: `url(${activeChat.avatar})` }} />
+            <div
+              className="size-10 rounded-full bg-center bg-cover border border-accent-red/20 shrink-0 cursor-pointer overflow-hidden"
+              style={{ backgroundImage: `url(${activeChat.isRoom ? activeChat.avatar : getAvatarUrl(activeChat.id)})` }}
+              onClick={() => setAvatarPreview({ url: activeChat.isRoom ? activeChat.avatar : getAvatarUrl(activeChat.id), name: activeChat.name })}
+            />
             <div className="flex-1 min-w-0">
-              <h2 className="text-[12px] font-bold text-white truncate">{activeChat.name}</h2>
+              <h2
+                className={`text-[12px] font-bold text-white truncate ${activeChat.isRoom ? 'cursor-pointer' : ''}`}
+                onClick={activeChat.isRoom ? async () => {
+                  setGroupInfoOpen(true);
+                  setGroupInfoLoading(true);
+                  const fid = chatDocIds[activeChat.id] || activeChat.id;
+                  try {
+                    const data = await getRoomDetails(fid);
+                    if (data) setGroupInfoData(data);
+                    else setGroupInfoData(null);
+                  } catch { setGroupInfoData(null); }
+                  finally { setGroupInfoLoading(false); }
+                } : undefined}
+              >
+                {activeChat.name}
+              </h2>
               <p className="text-[8px] text-accent-red uppercase font-bold tracking-tighter">
-                {isCalling ? (callMode === 'video' ? 'Video Calling...' : 'Voice Calling...') : activeChat.isRoom ? 'Tribe Chat' : 'Active Now'}
+                {isCalling
+                  ? (callMode === 'video' ? 'Video Calling...' : 'Voice Calling...')
+                  : activeChat.isRoom
+                    ? 'Tribe Chat'
+                    : (() => {
+                        const lastReadByChat = chatLastReadAt[activeChat.id] || {};
+                        const otherIds = Object.keys(lastReadByChat).filter((id) => id !== currentUserId);
+                        const lastSeen = otherIds.length ? lastReadByChat[otherIds[0]] : null;
+                        if (lastSeen) {
+                          const sec = (Date.now() - lastSeen.getTime()) / 1000;
+                          if (sec < 60) return 'Last seen just now';
+                          if (sec < 3600) return `Last seen ${Math.floor(sec / 60)}m ago`;
+                          if (sec < 86400) return `Last seen ${Math.floor(sec / 3600)}h ago`;
+                          return `Last seen ${lastSeen.toLocaleDateString()}`;
+                        }
+                        return 'Active Now';
+                      })()}
               </p>
             </div>
             {/* Voice & Video - always visible when not in call, for both 1:1 and group */}
@@ -1681,6 +1982,15 @@ const App: React.FC = () => {
                 </button>
               </>
             )}
+            <div className="flex items-center gap-1 min-w-0">
+              <input
+                type="text"
+                placeholder="Search..."
+                value={chatSearchQuery}
+                onChange={(e) => setChatSearchQuery(e.target.value)}
+                className="w-20 min-w-0 flex-1 max-w-[100px] bg-white/5 border border-white/10 rounded-lg px-2 py-1 text-[10px] text-white placeholder:text-white/40 focus:outline-none focus:border-accent-red/50"
+              />
+            </div>
             <div className="relative">
               <button onClick={() => setChatMenuOpen((o) => !o)} className="p-1 text-white/40 hover:text-white" title="Chat options">
                 <span className="material-symbols-outlined text-lg">more_vert</span>
@@ -1689,6 +1999,22 @@ const App: React.FC = () => {
                 <>
                   <div className="fixed inset-0 z-40" onClick={() => setChatMenuOpen(false)} />
                   <div className="absolute right-0 top-full mt-1 z-50 bg-night-panel border border-accent-red/30 rounded-xl shadow-xl py-1 min-w-[160px]">
+                    <button
+                      onClick={async () => {
+                        const fid = chatDocIds[activeChat.id] || (activeChat.isRoom ? activeChat.id : null);
+                        if (!fid || !currentUserId) return;
+                        const next = !mutedChats[activeChat.id];
+                        try {
+                          await setChatMute(currentUserId, fid, next);
+                          setMutedChats((prev) => ({ ...prev, [activeChat.id]: next }));
+                        } catch { /* ignore */ }
+                        setChatMenuOpen(false);
+                      }}
+                      className="w-full px-4 py-2.5 text-left text-[11px] font-bold text-white hover:bg-accent-red/20 flex items-center gap-2"
+                    >
+                      <span className="material-symbols-outlined text-base">{mutedChats[activeChat.id] ? 'notifications_off' : 'notifications'}</span>
+                      {mutedChats[activeChat.id] ? 'Unmute' : 'Mute'} notifications
+                    </button>
                     <button onClick={handleClearChat} className="w-full px-4 py-2.5 text-left text-[11px] font-bold text-white hover:bg-accent-red/20 flex items-center gap-2">
                       <span className="material-symbols-outlined text-base">delete_sweep</span>
                       Clear chat
@@ -1700,7 +2026,11 @@ const App: React.FC = () => {
           </div>
 
           <div className="flex-1 p-3 overflow-y-auto no-scrollbar space-y-3 relative">
-            {isCalling && callMode === 'video' ? (
+            {callDeclined ? (
+              <div className="py-6 text-center">
+                <p className="text-vibrant-pink text-[11px] font-bold uppercase">Call declined</p>
+              </div>
+            ) : isCalling && callMode === 'video' && !activeCallDoc ? (
               <div className="grid grid-cols-2 gap-2 mb-4 sticky top-0 z-20">
                 <div className="aspect-[4/5] bg-night-panel rounded-lg overflow-hidden border border-white/5 relative">
                   <img src={activeChat.avatar} className="w-full h-full object-cover grayscale opacity-30" alt="remote" />
@@ -1714,22 +2044,28 @@ const App: React.FC = () => {
                   ) : (
                     <video ref={videoRef} autoPlay playsInline muted className={`w-full h-full object-cover transition-transform duration-300 ${isFlipped ? 'scale-x-[-1]' : ''}`} />
                   )}
-                  <div className="absolute bottom-1.5 left-1.5 px-1 bg-accent-red text-[8px] rounded uppercase font-bold">You (Live)</div>
+                  <div className="absolute bottom-1.5 left-1.5 px-1 bg-accent-red text-[8px] rounded uppercase font-bold">Ringing...</div>
                 </div>
               </div>
-            ) : isCalling && callMode === 'audio' ? (
+            ) : isCalling && callMode === 'audio' && !activeCallDoc ? (
               <div className="flex flex-col items-center justify-center py-8 bg-accent-red/5 rounded-xl border border-accent-red/10 mb-4 sticky top-0 z-20">
                 <div className="size-20 rounded-full border-2 border-accent-red p-1 animate-vibe mb-4">
                   <img src={activeChat.avatar} className="w-full h-full rounded-full object-cover shadow-[0_0_20px_rgba(255,0,60,0.4)]" alt="avatar" />
                 </div>
-                <p className="text-accent-red text-[10px] font-bold uppercase tracking-widest animate-pulse">{activeChat.isRoom ? 'Tribe Connected...' : 'Voice Connected...'}</p>
+                <p className="text-accent-red text-[10px] font-bold uppercase tracking-widest animate-pulse">Ringing...</p>
               </div>
             ) : null}
 
             {/* Chat Log */}
             <div className="space-y-4">
               {messages.length === 0 && !isCalling && (
-                <div className="text-center py-10 opacity-20"><span className="material-symbols-outlined text-5xl mb-2">chat_bubble</span><p className="text-[10px] font-party uppercase">No messages yet. Say something!</p></div>
+                <div className="text-center py-10 opacity-20">
+                  {chatSearch ? (
+                    <><span className="material-symbols-outlined text-5xl mb-2">search_off</span><p className="text-[10px] font-party uppercase">No messages match &quot;{chatSearchQuery}&quot;</p></>
+                  ) : (
+                    <><span className="material-symbols-outlined text-5xl mb-2">chat_bubble</span><p className="text-[10px] font-party uppercase">No messages yet. Say something!</p></>
+                  )}
+                </div>
               )}
               {messages.map((msg, idx) => {
                 const prevDate = messages[idx - 1]?.createdAt;
@@ -1762,7 +2098,7 @@ const App: React.FC = () => {
                         )}
                         {msg.type === 'image' && msg.imageUrl && (
                           <div className="mb-1.5">
-                            <img src={msg.imageUrl} alt={msg.text || 'Image'} className="max-w-full max-h-[280px] rounded-xl object-contain" />
+                            <img src={msg.imageUrl} alt={msg.text || 'Image'} className="max-w-full max-h-[280px] rounded-xl object-contain" loading="lazy" />
                             {msg.text && msg.text !== 'Photo' && <p className="text-[10px] mt-1 opacity-90">{msg.text}</p>}
                           </div>
                         )}
@@ -1778,7 +2114,12 @@ const App: React.FC = () => {
                             {msg.text && msg.text !== 'File' ? msg.text : 'File'}
                           </a>
                         )}
-                        {msg.type !== 'image' && msg.type !== 'video' && (msg.type !== 'file' || !msg.imageUrl) && msg.text}
+                        {msg.type === 'audio' && (msg.audioUrl || msg.imageUrl) && (
+                          <div className="flex items-center gap-2">
+                            <audio src={msg.audioUrl || msg.imageUrl} controls className="max-w-full h-8 min-w-[180px]" />
+                          </div>
+                        )}
+                        {msg.type !== 'image' && msg.type !== 'video' && (msg.type !== 'file' || !msg.imageUrl) && msg.type !== 'audio' && msg.text}
                         {Object.keys(msg.reactions || {}).length > 0 && (
                           <div className="flex flex-wrap gap-1.5 mt-1.5">
                             {Object.entries(
@@ -1794,6 +2135,15 @@ const App: React.FC = () => {
                       </div>
                       <div className="flex items-center gap-2 mt-1 px-1">
                         <span className="text-[8px] text-gray-600">{msg.timestamp}</span>
+                        {msg.senderId === currentUserId && (
+                          <span className="text-[10px] flex items-center" title={isRead(msg) ? 'Read' : 'Sent'}>
+                            {isRead(msg) ? (
+                              <span className="text-blue-400" aria-label="Read"><span className="material-symbols-outlined text-sm">done_all</span></span>
+                            ) : (
+                              <span className="text-gray-500" aria-label="Sent"><span className="material-symbols-outlined text-sm">done</span></span>
+                            )}
+                          </span>
+                        )}
                         {firestoreChatId && (
                           <>
                             <button type="button" onClick={(e) => { e.stopPropagation(); const rect = (e.target as HTMLElement).getBoundingClientRect(); setMessageContextMenu({ msg, x: Math.min(rect.left, window.innerWidth - 160), y: rect.bottom + 4 }); }} className="p-0.5 rounded hover:bg-white/10 text-white/50 hover:text-accent-red opacity-60 hover:opacity-100" title="Message options">
@@ -1889,6 +2239,9 @@ const App: React.FC = () => {
               <button type="button" onClick={() => chatAttachRef.current?.click()} disabled={isUploadingMedia} className="text-accent-red/60 hover:text-accent-red disabled:opacity-50 transition-colors" title="Attach photo, video or file">
                 <span className="material-symbols-outlined text-xl">{isUploadingMedia ? 'hourglass_empty' : 'attach_file'}</span>
               </button>
+              <button type="button" onClick={toggleVoiceRecording} disabled={isUploadingMedia} className={`transition-colors ${isRecordingVoice ? 'text-accent-red animate-pulse' : 'text-accent-red/60 hover:text-accent-red'} disabled:opacity-50`} title={isRecordingVoice ? 'Stop and send' : 'Voice message'}>
+                <span className="material-symbols-outlined text-xl">{isRecordingVoice ? 'stop_circle' : 'mic'}</span>
+              </button>
               <input 
                 value={chatInput}
                 onChange={(e) => setChatInput(e.target.value)}
@@ -1922,6 +2275,171 @@ const App: React.FC = () => {
                   </div>
                 </div>
               </>
+            )}
+
+            {/* Group Info Panel - WhatsApp-style */}
+            {activeChat.isRoom && groupInfoOpen && (
+              <div className="absolute inset-0 z-50 bg-night-black animate-in slide-in-from-right duration-300 flex flex-col">
+                <div className="flex items-center gap-3 p-4 border-b border-white/5 bg-night-panel/50">
+                  <button onClick={() => { setGroupInfoOpen(false); setGroupAddMemberOpen(false); }} className="text-accent-red p-1 rounded-full hover:bg-accent-red/10">
+                    <span className="material-symbols-outlined">arrow_back</span>
+                  </button>
+                  <h2 className="text-sm font-party text-white uppercase tracking-widest">Group Info</h2>
+                </div>
+                <div className="flex-1 overflow-y-auto no-scrollbar p-4">
+                  {groupInfoLoading ? (
+                    <div className="flex justify-center py-12"><div className="size-8 rounded-full border-2 border-accent-red border-t-transparent animate-spin" /></div>
+                  ) : groupInfoData ? (
+                    <>
+                      <div className="flex flex-col items-center py-6 border-b border-white/5">
+                        <input ref={groupAvatarInputRef} type="file" accept="image/*" className="hidden" onChange={async (e) => {
+                          const file = e.target.files?.[0];
+                          e.target.value = '';
+                          if (!file || !currentUserId || !groupInfoData) return;
+                          try {
+                            const url = await uploadGroupAvatar(groupInfoData.$id, currentUserId, file);
+                            setGroupInfoData(prev => prev ? { ...prev, avatarUrl: url } : null);
+                            setActiveChat(prev => prev && prev.id === groupInfoData.$id ? { ...prev, avatar: url } : prev);
+                            setRooms(prev => prev.map(r => r.id === groupInfoData.$id ? { ...r, avatar: url } : r));
+                          } catch (err: any) { window.alert(err?.message || 'Failed'); }
+                        }} />
+                        <div
+                          onClick={() => (groupInfoData.participantIds || []).includes(currentUserId || '') && groupAvatarInputRef.current?.click()}
+                          className={`relative ${(groupInfoData.participantIds || []).includes(currentUserId || '') ? 'cursor-pointer group' : ''}`}
+                        >
+                          <div className="size-20 rounded-full bg-center bg-cover border-2 border-accent-red/30 mb-3 overflow-hidden shrink-0" style={{ backgroundImage: `url(${groupInfoData.avatarUrl || activeChat.avatar})` }} />
+                          {(groupInfoData.participantIds || []).includes(currentUserId || '') && (
+                            <div className="absolute inset-0 flex items-center justify-center rounded-2xl bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity">
+                              <span className="material-symbols-outlined text-white text-2xl">add_a_photo</span>
+                            </div>
+                          )}
+                        </div>
+                        <p className="text-base font-bold text-white">{groupInfoData.name}</p>
+                        <p className="text-[10px] text-gray-500 uppercase tracking-wider mt-1">{groupInfoData.participantIds?.length || 0} participants</p>
+                      </div>
+                      <div className="py-4">
+                        <div className="flex justify-between items-center mb-3">
+                          <p className="text-[10px] font-party tracking-[0.2em] text-accent-red uppercase">Participants</p>
+                          {(groupInfoData.adminIds || []).includes(currentUserId || '') && (
+                            <button onClick={() => setGroupAddMemberOpen(true)} className="flex items-center gap-1.5 px-3 py-1.5 bg-accent-red/20 border border-accent-red/40 rounded-full text-accent-red text-[10px] font-bold uppercase">
+                              <span className="material-symbols-outlined text-sm">person_add</span> Add
+                            </button>
+                          )}
+                        </div>
+                        <div className="space-y-2">
+                          {groupInfoData.participantIds?.map((uid) => {
+                            const name = groupInfoData.participantData?.[uid]?.displayName || (uid === currentUserId ? (displayName || 'You') : 'Unknown');
+                            const isAdmin = (groupInfoData.adminIds || []).includes(uid);
+                            const isOwner = groupInfoData.ownerId === uid;
+                            const isMe = uid === currentUserId;
+                            const iAmAdmin = (groupInfoData.adminIds || []).includes(currentUserId || '');
+                            const canRemove = iAmAdmin && !isOwner && !isMe;
+                            const canMakeAdmin = iAmAdmin && !isAdmin && !isOwner && !isMe;
+                            const canDemoteAdmin = iAmAdmin && groupInfoData.ownerId === currentUserId && isAdmin && !isOwner;
+                            return (
+                              <div key={uid} className="flex items-center gap-3 py-2.5 px-3 rounded-xl bg-white/5 border border-white/5 hover:bg-white/[0.07]">
+                                <div className="size-10 rounded-full bg-center bg-cover border border-accent-red/20 shrink-0 overflow-hidden cursor-pointer" style={{ backgroundImage: `url(${getAvatarUrl(uid)})` }} onClick={() => setAvatarPreview({ url: getAvatarUrl(uid), name })} />
+                                <div className="flex-1 min-w-0">
+                                  <p className="text-[12px] font-bold text-white truncate">{name}{isMe ? ' (You)' : ''}</p>
+                                  <div className="flex gap-1.5 mt-0.5">
+                                    {isOwner && <span className="text-[8px] bg-accent-red/30 text-accent-red px-1.5 py-0.5 rounded uppercase font-bold">Creator</span>}
+                                    {isAdmin && !isOwner && <span className="text-[8px] bg-accent-red/20 text-accent-red px-1.5 py-0.5 rounded uppercase font-bold">Admin</span>}
+                                  </div>
+                                </div>
+                                {!isMe && (canRemove || canMakeAdmin || canDemoteAdmin) && (
+                                  <div className="flex gap-1 shrink-0">
+                                    {canMakeAdmin && (
+                                      <button onClick={async () => {
+                                        if (!currentUserId || !groupInfoData) return;
+                                        try {
+                                          await updateRoomAdmin(groupInfoData.$id, currentUserId, uid, true);
+                                          setGroupInfoData(prev => prev ? { ...prev, adminIds: [...(prev.adminIds || []), uid] } : null);
+                                        } catch (e: any) { window.alert(e?.message || 'Failed'); }
+                                      }} className="p-1.5 rounded-full bg-accent-red/20 text-accent-red hover:bg-accent-red/30" title="Make admin">
+                                        <span className="material-symbols-outlined text-base">admin_panel_settings</span>
+                                      </button>
+                                    )}
+                                    {canDemoteAdmin && (
+                                      <button onClick={async () => {
+                                        if (!currentUserId || !groupInfoData) return;
+                                        try {
+                                          await updateRoomAdmin(groupInfoData.$id, currentUserId, uid, false);
+                                          setGroupInfoData(prev => prev ? { ...prev, adminIds: (prev.adminIds || []).filter(id => id !== uid) } : null);
+                                        } catch (e: any) { window.alert(e?.message || 'Failed'); }
+                                      }} className="p-1.5 rounded-full bg-white/10 text-gray-400 hover:bg-white/20" title="Remove as admin">
+                                        <span className="material-symbols-outlined text-base">remove_moderator</span>
+                                      </button>
+                                    )}
+                                    {canRemove && (
+                                      <button onClick={async () => {
+                                        if (!currentUserId || !groupInfoData || !window.confirm(`Remove ${name} from group?`)) return;
+                                        try {
+                                          await removeRoomMember(groupInfoData.$id, currentUserId, uid);
+                                          setGroupInfoData(prev => {
+                                            if (!prev) return null;
+                                            const pd = { ...prev.participantData }; delete pd[uid];
+                                            return { ...prev, participantIds: (prev.participantIds || []).filter(id => id !== uid), participantData: pd };
+                                          });
+                                          const rc = recentChats.find(c => c.$id === groupInfoData.$id);
+                                          if (rc) setRecentChats(prev => prev.map(c => c.$id === groupInfoData.$id ? { ...c, participantIds: (c.participantIds || []).filter(id => id !== uid) } : c));
+                                        } catch (e: any) { window.alert(e?.message || 'Failed'); }
+                                      }} className="p-1.5 rounded-full bg-vibrant-pink/20 text-vibrant-pink hover:bg-vibrant-pink/30" title="Remove from group">
+                                        <span className="material-symbols-outlined text-base">person_remove</span>
+                                      </button>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      {/* Add member modal */}
+                      {groupAddMemberOpen && (
+                        <div className="fixed inset-0 z-[60] bg-black/80 flex flex-col">
+                          <div className="flex items-center gap-3 p-4 border-b border-white/5 bg-night-panel">
+                            <button onClick={() => setGroupAddMemberOpen(false)} className="text-accent-red p-1"><span className="material-symbols-outlined">arrow_back</span></button>
+                            <h3 className="text-sm font-bold text-white">Add participants</h3>
+                          </div>
+                          <div className="flex-1 overflow-y-auto p-4">
+                            <input value={tribeMemberSearch} onChange={(e) => setTribeMemberSearch(e.target.value)} placeholder="Search by name or email..." className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-500 mb-4" />
+                            <div className="space-y-2">
+                              {tribeSearchedUsers.filter(u => !groupInfoData!.participantIds?.includes(u.id)).map((u) => (
+                                <div key={u.id} className="flex items-center gap-4 py-3 px-3 rounded-xl border border-white/5 hover:bg-white/5">
+                                  <div className="size-10 rounded-full bg-center bg-cover border border-accent-red/20 overflow-hidden shrink-0" style={{ backgroundImage: `url(${getAvatarUrl(u.id)})` }} />
+                                  <div className="flex-1 min-w-0">
+                                    <p className="text-sm font-bold text-white truncate">{u.displayName || u.email || 'Unknown'}</p>
+                                    {u.email && <p className="text-[10px] text-gray-500 truncate">{u.email}</p>}
+                                  </div>
+                                  <button onClick={async () => {
+                                    if (!currentUserId || !groupInfoData) return;
+                                    try {
+                                      await addRoomMembers(groupInfoData.$id, currentUserId, [u.id], { [u.id]: { displayName: u.displayName || u.email || 'Unknown' } });
+                                      setGroupInfoData(prev => prev ? { ...prev, participantIds: [...(prev.participantIds || []), u.id], participantData: { ...prev.participantData, [u.id]: { displayName: u.displayName || u.email || 'Unknown' } } } : null);
+                                      setGroupAddMemberOpen(false);
+                                      setTribeMemberSearch('');
+                                      setTribeSearchedUsers([]);
+                                    } catch (e: any) { window.alert(e?.message || 'Failed'); }
+                                  }} className="px-4 py-2 bg-accent-red/20 border border-accent-red/40 rounded-full text-accent-red text-[10px] font-bold uppercase">Add</button>
+                                </div>
+                              ))}
+                              {tribeMemberSearch.trim() && tribeSearchedUsers.length === 0 && !userSearchLoading && (
+                                <p className="text-[10px] text-gray-500 py-4 text-center">No users found. Try a different search.</p>
+                              )}
+                              {!tribeMemberSearch.trim() && (
+                                <p className="text-[10px] text-gray-500 py-4 text-center">Search for users to add.</p>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <p className="text-center text-gray-500 text-sm py-8">Could not load group info.</p>
+                  )}
+                </div>
+              </div>
             )}
           </div>
         </div>
@@ -1974,7 +2492,7 @@ const App: React.FC = () => {
                   const chatUser: User = {
                     id: otherId,
                     name: otherDisplayName.toUpperCase(),
-                    avatar: `https://picsum.photos/seed/${encodeURIComponent(otherId)}/200`,
+                    avatar: getAvatarUrl(otherId),
                     status: 'online',
                     onBakchod: true,
                     appUserId: otherId,
@@ -1988,8 +2506,8 @@ const App: React.FC = () => {
                         className="flex flex-1 min-w-0 items-center gap-3 cursor-pointer"
                         onClick={() => selectChat(chatUser, false)}
                       >
-                        <div className="relative shrink-0">
-                          <div className="size-10 rounded-full bg-cover border border-accent-red/20 group-hover:border-accent-red/50 transition-all" style={{ backgroundImage: `url(https://picsum.photos/seed/${encodeURIComponent(otherId)}/200)` }} />
+                        <div className="relative shrink-0" onClick={(e) => { e.stopPropagation(); setAvatarPreview({ url: getAvatarUrl(otherId), name: otherDisplayName }); }}>
+                          <div className="size-10 rounded-full bg-center bg-cover border border-accent-red/20 group-hover:border-accent-red/50 transition-all overflow-hidden shrink-0 cursor-pointer" style={{ backgroundImage: `url(${getAvatarUrl(otherId)})` }} />
                           {((chat as any).unreadCounts?.[currentUserId ?? ''] ?? 0) > 0 && (
                             <span className="absolute -top-0.5 -right-0.5 min-w-[18px] h-[18px] px-1 flex items-center justify-center rounded-full bg-accent-red text-white text-[10px] font-bold">
                               {Math.min((chat as any).unreadCounts?.[currentUserId ?? ''] ?? 0, 99)}
@@ -2003,10 +2521,10 @@ const App: React.FC = () => {
                         <span className="material-symbols-outlined text-accent-red/60 text-lg shrink-0">chevron_right</span>
                       </div>
                       <div className="flex gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
-                        <button type="button" onClick={() => startCall('audio', { id: otherId, name: otherDisplayName, avatar: `https://picsum.photos/seed/${encodeURIComponent(otherId)}/200`, isRoom: false })} className="size-8 rounded-full bg-white/10 flex items-center justify-center text-accent-red hover:bg-accent-red hover:text-white transition-all" title="Voice call">
+                        <button type="button" onClick={() => startCall('audio', { id: otherId, name: otherDisplayName, avatar: getAvatarUrl(otherId), isRoom: false })} className="size-8 rounded-full bg-white/10 flex items-center justify-center text-accent-red hover:bg-accent-red hover:text-white transition-all" title="Voice call">
                           <span className="material-symbols-outlined text-base">call</span>
                         </button>
-                        <button type="button" onClick={() => startCall('video', { id: otherId, name: otherDisplayName, avatar: `https://picsum.photos/seed/${encodeURIComponent(otherId)}/200`, isRoom: false })} className="size-8 rounded-full bg-accent-red/20 flex items-center justify-center text-accent-red hover:bg-accent-red hover:text-white transition-all" title="Video call">
+                        <button type="button" onClick={() => startCall('video', { id: otherId, name: otherDisplayName, avatar: getAvatarUrl(otherId), isRoom: false })} className="size-8 rounded-full bg-accent-red/20 flex items-center justify-center text-accent-red hover:bg-accent-red hover:text-white transition-all" title="Video call">
                           <span className="material-symbols-outlined text-base">videocam</span>
                         </button>
                       </div>
@@ -2031,8 +2549,8 @@ const App: React.FC = () => {
                     className="flex flex-1 min-w-0 items-center gap-4 cursor-pointer"
                     onClick={() => selectChat(room, true)}
                   >
-                    <div className="relative shrink-0">
-                      <div className="size-11 rounded-lg bg-cover border border-white/10 group-hover:border-accent-red/50 transition-all group-hover:shadow-[0_0_15px_rgba(255,0,60,0.2)]" style={{ backgroundImage: `url(${room.avatar})` }} />
+                    <div className="relative shrink-0" onClick={(e) => { e.stopPropagation(); setAvatarPreview({ url: room.avatar, name: room.name }); }}>
+                      <div className="size-11 rounded-full bg-center bg-cover border border-white/10 group-hover:border-accent-red/50 transition-all group-hover:shadow-[0_0_15px_rgba(255,0,60,0.2)] overflow-hidden shrink-0 cursor-pointer" style={{ backgroundImage: `url(${room.avatar})` }} />
                       {unread > 0 && (
                         <span className="absolute -top-0.5 -right-0.5 min-w-[18px] h-[18px] px-1 flex items-center justify-center rounded-full bg-accent-red text-white text-[10px] font-bold">
                           {Math.min(unread, 99)}
@@ -2071,27 +2589,27 @@ const App: React.FC = () => {
                 <h2 className="text-sm font-party text-white uppercase tracking-widest">Contact Intel</h2>
               </div>
               <div className="flex flex-col items-center py-8 px-6 border-b border-white/5 bg-accent-red/5">
-                <div className="size-24 rounded-full border-4 border-accent-red p-1 mb-4 shadow-[0_0_30px_rgba(255,0,60,0.3)]">
-                  <img src={contact.avatar} className="w-full h-full rounded-full object-cover" alt="avatar" />
+                <div className="size-24 rounded-full border-4 border-accent-red p-1 mb-4 shadow-[0_0_30px_rgba(255,0,60,0.3)] cursor-pointer" onClick={() => setAvatarPreview({ url: contact.contactId?.startsWith('r-') ? contact.avatar : getAvatarUrl(contact.contactId), name: contact.name })}>
+                  <img src={contact.contactId?.startsWith('r-') ? contact.avatar : getAvatarUrl(contact.contactId)} className="w-full h-full rounded-full object-cover" alt="avatar" />
                 </div>
                 <h3 className="text-xl font-party text-white tracking-widest neon-text mb-1 uppercase">{contact.name}</h3>
                 <p className="text-[10px] text-accent-red font-bold uppercase tracking-[0.2em] mb-6">Elite Bakchod Legend</p>
                 
                 <div className="grid grid-cols-3 gap-4 w-full">
-                  <button onClick={() => startCall('audio', { id: contact.contactId, name: contact.name, avatar: contact.avatar, isRoom: contact.isRoom ?? contact.contactId.startsWith('r-') })} className="flex flex-col items-center gap-2 group">
+                  <button onClick={() => startCall('audio', { id: contact.contactId, name: contact.name, avatar: contact.contactId?.startsWith('r-') ? contact.avatar : getAvatarUrl(contact.contactId), isRoom: contact.isRoom ?? contact.contactId.startsWith('r-') })} className="flex flex-col items-center gap-2 group">
                     <div className="size-12 rounded-2xl bg-white/5 border border-white/10 flex items-center justify-center text-accent-red group-hover:bg-accent-red group-hover:text-white transition-all shadow-lg active:scale-95">
                       <span className="material-symbols-outlined">call</span>
                     </div>
                     <span className="text-[8px] font-bold text-gray-500 uppercase tracking-widest">Voice</span>
                   </button>
-                  <button onClick={() => startCall('video', { id: contact.contactId, name: contact.name, avatar: contact.avatar, isRoom: contact.isRoom ?? contact.contactId.startsWith('r-') })} className="flex flex-col items-center gap-2 group">
+                  <button onClick={() => startCall('video', { id: contact.contactId, name: contact.name, avatar: contact.contactId?.startsWith('r-') ? contact.avatar : getAvatarUrl(contact.contactId), isRoom: contact.isRoom ?? contact.contactId.startsWith('r-') })} className="flex flex-col items-center gap-2 group">
                     <div className="size-12 rounded-2xl bg-accent-red/10 border border-accent-red/20 flex items-center justify-center text-accent-red group-hover:bg-accent-red group-hover:text-white transition-all shadow-[0_0_15px_rgba(255,0,60,0.2)] active:scale-95">
                       <span className="material-symbols-outlined">videocam</span>
                     </div>
                     <span className="text-[8px] font-bold text-gray-500 uppercase tracking-widest">Video</span>
                   </button>
                   <button
-                    onClick={() => contact && addContactFromDetails(contact.contactId, contact.name, contact.avatar)}
+                    onClick={() => contact && addContactFromDetails(contact.contactId, contact.name, contact.contactId?.startsWith('r-') ? contact.avatar : getAvatarUrl(contact.contactId))}
                     disabled={!contact || contact.contactId.startsWith('r-') || isSavedContact}
                     className="flex flex-col items-center gap-2 group disabled:opacity-40 disabled:cursor-not-allowed"
                   >
@@ -2207,35 +2725,38 @@ const App: React.FC = () => {
       case 'me': 
         return (
           <div className="p-12 text-center flex flex-col items-center">
-            <input 
-              type="file" 
-              ref={fileInputRef} 
-              className="hidden" 
-              accept="image/*" 
-              onChange={handleAvatarChange}
-            />
-            <div 
-              onClick={() => fileInputRef.current?.click()}
-              className="group relative cursor-pointer"
+            <div
+              onClick={() => setAvatarPreview({ url: userAvatar, name: displayName })}
+              className="group relative cursor-pointer inline-block"
             >
-              <div className="size-24 rounded-full border-4 border-accent-red p-1 mb-4 overflow-hidden shadow-[0_0_40px_rgba(255,0,60,0.5)] transition-transform group-hover:scale-105 active:scale-95">
+              <div className="size-24 rounded-full border-4 border-accent-red p-1 mb-4 overflow-hidden shadow-[0_0_40px_rgba(255,0,60,0.5)] transition-transform group-hover:scale-105 active:scale-95 mx-auto">
                 <img src={userAvatar} alt="me" className="w-full h-full rounded-full object-cover" />
               </div>
-              <div className="absolute inset-0 size-24 flex items-center justify-center rounded-full bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity">
-                <span className="material-symbols-outlined text-white text-3xl">add_a_photo</span>
+              <div className="absolute inset-0 top-0 left-1/2 -translate-x-1/2 size-24 rounded-full flex items-center justify-center bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
+                <span className="material-symbols-outlined text-white text-3xl">visibility</span>
               </div>
             </div>
             <p className="text-base font-party text-white uppercase tracking-widest">{displayName}</p>
             <div className="mt-3 px-4 py-1.5 bg-accent-red/10 border border-accent-red/20 rounded-full">
                 <p className="text-[11px] text-accent-red uppercase font-black tracking-widest">Level 99 Legend</p>
             </div>
-            <button 
-              onClick={() => fileInputRef.current?.click()}
-              className="mt-6 flex items-center gap-2 px-5 py-2.5 bg-white/5 border border-white/10 rounded-xl text-[12px] font-bold text-white hover:bg-white/10 transition-all"
-            >
-              <span className="material-symbols-outlined text-sm">edit</span>
-              Update Profile Pic
-            </button>
+            <label className={`mt-6 flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl text-[12px] font-bold transition-all cursor-pointer ${profilePicUploading ? 'opacity-50 cursor-not-allowed' : 'bg-white/5 border border-white/10 text-white hover:bg-white/10'}`}>
+              <input type="file" className="sr-only" accept="image/*" onChange={handleAvatarChange} disabled={profilePicUploading} />
+              {profilePicUploading ? <span className="material-symbols-outlined text-sm animate-spin">progress_activity</span> : <span className="material-symbols-outlined text-sm">edit</span>}
+              {profilePicUploading ? 'Uploading...' : 'Update Profile Pic'}
+            </label>
+            {isPushSupported() && currentUserId && (
+              <button
+                onClick={async () => {
+                  const ok = await registerForPushNotifications(currentUserId);
+                  window.alert(ok ? 'Push notifications enabled!' : 'Could not enable. Check permission and VAPID key.');
+                }}
+                className="mt-4 flex items-center gap-2 px-5 py-2.5 bg-accent-red/10 border border-accent-red/30 rounded-xl text-[12px] font-bold text-accent-red hover:bg-accent-red/20 transition-all"
+              >
+                <span className="material-symbols-outlined text-sm">notifications</span>
+                Enable push notifications
+              </button>
+            )}
           </div>
         );
       default: return null;
@@ -2255,6 +2776,38 @@ const App: React.FC = () => {
 
   return (
     <Layout ecstasyMode={ecstasyMode}>
+      {activeCallDoc?.status === 'accepted' && (
+        <div className="fixed inset-0 z-[90] bg-black flex flex-col">
+          <div className="flex-1 min-h-0 p-4">
+            <JitsiCallView
+              roomName={activeCallDoc.roomName}
+              displayName={displayName || 'You'}
+              mode={activeCallDoc.mode}
+              onEnd={handleEndCall}
+              className="h-full"
+            />
+          </div>
+          <div className="p-4 flex justify-center">
+            <button onClick={handleEndCall} className="px-8 py-3 bg-vibrant-pink rounded-full text-white text-sm font-bold uppercase shadow-lg hover:bg-accent-red transition-colors">
+              End Call
+            </button>
+          </div>
+        </div>
+      )}
+      {avatarPreview && (
+        <div
+          className="fixed inset-0 z-[100] bg-black/90 flex items-center justify-center p-4"
+          onClick={() => setAvatarPreview(null)}
+        >
+          <button onClick={() => setAvatarPreview(null)} className="absolute top-4 right-4 size-10 rounded-full bg-white/10 flex items-center justify-center text-white hover:bg-white/20 z-10">
+            <span className="material-symbols-outlined">close</span>
+          </button>
+          <div className="flex flex-col items-center max-w-full max-h-full" onClick={(e) => e.stopPropagation()}>
+            <img src={avatarPreview.url} alt={avatarPreview.name || 'Profile'} className="max-w-full max-h-[85vh] w-auto h-auto object-contain rounded-2xl shadow-2xl" />
+            {avatarPreview.name && <p className="mt-3 text-white text-sm font-bold uppercase tracking-widest">{avatarPreview.name}</p>}
+          </div>
+        </div>
+      )}
       <InviteModal
         isOpen={isInviteOpen}
         inviteTargetType={inviteTargetType}
@@ -2268,6 +2821,25 @@ const App: React.FC = () => {
         onClose={() => setIsInviteOpen(false)}
         onSubmit={handleInviteSubmit}
       />
+      {incomingCall && (
+        <div className="fixed inset-0 z-[100] bg-black/80 backdrop-blur-md flex items-center justify-center p-6 animate-in fade-in duration-200">
+          <div className="w-full max-w-sm glass-card rounded-2xl border-2 border-accent-red p-6 text-center">
+            <div className="size-20 rounded-full bg-accent-red/20 border-2 border-accent-red flex items-center justify-center mx-auto mb-4 animate-pulse">
+              <span className="material-symbols-outlined text-accent-red text-4xl">{incomingCall.mode === 'audio' ? 'call' : 'videocam'}</span>
+            </div>
+            <p className="text-[10px] text-gray-400 uppercase tracking-widest mb-1">Incoming {incomingCall.mode === 'audio' ? 'voice' : 'video'} call</p>
+            <p className="text-lg font-bold text-white mb-6">{incomingCall.fromDisplayName || 'Someone'}</p>
+            <div className="flex gap-4 justify-center">
+              <button onClick={handleDeclineCall} className="size-14 rounded-full bg-vibrant-pink flex items-center justify-center text-white hover:scale-105 active:scale-95 transition-transform">
+                <span className="material-symbols-outlined text-2xl">call_end</span>
+              </button>
+              <button onClick={handleAcceptCall} className="size-14 rounded-full bg-green-600 flex items-center justify-center text-white hover:scale-105 active:scale-95 transition-transform">
+                <span className="material-symbols-outlined text-2xl">{incomingCall.mode === 'audio' ? 'call' : 'videocam'}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       <ContactInviteModal
         contact={pendingInviteContact}
         onClose={() => setPendingInviteContact(null)}
@@ -2375,7 +2947,7 @@ const App: React.FC = () => {
           <span className="material-symbols-outlined text-2xl font-bold">smart_toy</span>
           <span className="text-[10px] font-bold font-party uppercase tracking-tight">Bot</span>
         </div>
-        <div onClick={() => {setActiveTab('me'); setActiveChat(null); setIsCalling(false); setIsCreatingGroup(false); setIsSettingsOpen(false); setActiveHistoryContactId(null);}} className={`flex flex-col items-center gap-1.5 cursor-pointer group transition-all active:text-vibrant-pink ${activeTab === 'me' ? 'text-vibrant-pink scale-110 shadow-[0_0_15px_rgba(255,0,160,0.3)]' : 'text-accent-red'}`}>
+        <div onClick={() => {setActiveTab('me'); setActiveChat(null); setIsCalling(false); setIsCreatingGroup(false); setIsSettingsOpen(true); setActiveHistoryContactId(null);}} className={`flex flex-col items-center gap-1.5 cursor-pointer group transition-all active:text-vibrant-pink ${activeTab === 'me' ? 'text-vibrant-pink scale-110 shadow-[0_0_15px_rgba(255,0,160,0.3)]' : 'text-accent-red'}`}>
           <div className={`size-5.5 rounded-full border-2 bg-cover transition-all active:border-vibrant-pink ${activeTab === 'me' ? 'border-vibrant-pink shadow-sm' : 'border-accent-red group-hover:border-vibrant-pink/50'}`} style={{ backgroundImage: `url(${userAvatar})` }} />
           <span className="text-[10px] font-bold font-party uppercase tracking-tight">Me</span>
         </div>

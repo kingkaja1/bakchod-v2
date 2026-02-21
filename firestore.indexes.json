@@ -4,16 +4,24 @@
       "collectionGroup": "chats",
       "queryScope": "COLLECTION",
       "fields": [
-        { "fieldPath": "participants", "order": "ASCENDING" },
-        { "fieldPath": "lastMessageAt", "order": "DESCENDING" }
+        {"fieldPath": "participants", "order": "ASCENDING"},
+        {"fieldPath": "lastMessageAt", "order": "DESCENDING"}
       ]
     },
     {
       "collectionGroup": "invites",
       "queryScope": "COLLECTION",
       "fields": [
-        { "fieldPath": "targetType", "order": "ASCENDING" },
-        { "fieldPath": "targetValue", "order": "ASCENDING" }
+        {"fieldPath": "targetType", "order": "ASCENDING"},
+        {"fieldPath": "targetValue", "order": "ASCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "calls",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "targetParticipantIds", "order": "ASCENDING"},
+        {"fieldPath": "status", "order": "ASCENDING"}
       ]
     }
   ],

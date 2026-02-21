@@ -21,8 +21,9 @@ export interface Message {
   senderName: string;
   text: string;
   timestamp: string;
-  type: 'text' | 'image' | 'video' | 'file' | 'roast';
+  type: 'text' | 'image' | 'video' | 'file' | 'audio' | 'roast';
   imageUrl?: string;
+  audioUrl?: string;
   replyTo?: ReplyTo;
   reactions?: Record<string, string>;
   createdAt?: Date;

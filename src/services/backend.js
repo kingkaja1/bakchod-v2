@@ -70,6 +70,50 @@ export async function updateUserProfileCallable(input) {
   }
 }
 
+/** Upload profile photo and update profiles + users. Returns avatarUrl. */
+export async function uploadProfilePhoto(userId, file) {
+  const ext = (file.name || '').split('.').pop() || 'jpg';
+  const path = `profiles/${userId}/avatar_${Date.now()}.${ext}`;
+  const storageRef = ref(storage, path);
+  // Use image/jpeg for compatibility (some mobile formats like HEIC may not be supported)
+  const contentType = /^image\/(jpeg|jpg|png|gif|webp)$/i.test(file.type) ? file.type : 'image/jpeg';
+  await uploadBytes(storageRef, file, { contentType });
+  const avatarUrl = await getDownloadURL(storageRef);
+  const profileRef = doc(db, 'profiles', userId);
+  const userRef = doc(db, 'users', userId);
+  // Use setDoc with merge so it works even if profile/users doc doesn't exist yet
+  await setDoc(profileRef, { avatarUrl, userId, updatedAt: serverTimestamp() }, { merge: true });
+  await setDoc(userRef, { photoURL: avatarUrl, updatedAt: serverTimestamp() }, { merge: true });
+  return avatarUrl;
+}
+
+/** Get user's avatar URL from users or profiles. */
+export async function getUserAvatarUrl(userId) {
+  try {
+    const userSnap = await getDoc(doc(db, 'users', userId));
+    if (userSnap.exists() && userSnap.data().photoURL) return userSnap.data().photoURL;
+    const profileSnap = await getDoc(doc(db, 'profiles', userId));
+    if (profileSnap.exists() && profileSnap.data().avatarUrl) return profileSnap.data().avatarUrl;
+  } catch {}
+  return null;
+}
+
+/** Upload group avatar. Any participant can change the group photo. */
+export async function uploadGroupAvatar(chatId, userId, file) {
+  const chatSnap = await getDoc(doc(db, 'chats', chatId));
+  if (!chatSnap.exists()) throw new Error('Group not found');
+  const data = chatSnap.data();
+  const participantIds = data.participantIds || [];
+  if (!participantIds.includes(userId)) throw new Error('Only participants can change group photo');
+  const ext = (file.name || '').split('.').pop() || 'jpg';
+  const path = `groups/${chatId}/avatar_${Date.now()}.${ext}`;
+  const storageRef = ref(storage, path);
+  await uploadBytes(storageRef, file, { contentType: file.type || 'image/jpeg' });
+  const avatarUrl = await getDownloadURL(storageRef);
+  await updateDoc(doc(db, 'chats', chatId), { avatarUrl, updatedAt: serverTimestamp() });
+  return avatarUrl;
+}
+
 export async function syncContactsCallable(contacts, options = {}) {
   try {
     const fn = httpsCallable(functions, 'syncContacts');
@@ -114,11 +158,92 @@ export async function createRoom(params) {
     type: 'room',
     participantIds: uniqueIds,
     participantData: participantData || {},
+    adminIds: [ownerId],
     updatedAt: serverTimestamp(),
     createdAt: serverTimestamp(),
   });
   const snap = await getDoc(doc(db, 'chats', created.id));
   return { $id: snap.id, ...snap.data() };
+}
+
+/** Get room details (participants, admins, avatar). */
+export async function getRoomDetails(chatId) {
+  const snap = await getDoc(doc(db, 'chats', chatId));
+  if (!snap.exists()) return null;
+  const d = snap.data();
+  return {
+    $id: snap.id,
+    name: d.name,
+    ownerId: d.ownerId,
+    participantIds: d.participantIds || [],
+    participantData: d.participantData || {},
+    adminIds: d.adminIds || (d.ownerId ? [d.ownerId] : []),
+    avatarUrl: d.avatarUrl || null,
+    isRoom: !!d.isRoom,
+  };
+}
+
+/** Add members to a room. Caller must be admin. */
+export async function addRoomMembers(chatId, userId, newMemberIds, participantDataAdditions) {
+  const chatRef = doc(db, 'chats', chatId);
+  const chatSnap = await getDoc(chatRef);
+  if (!chatSnap.exists()) throw new Error('Room not found');
+  const data = chatSnap.data();
+  const adminIds = data.adminIds || (data.ownerId ? [data.ownerId] : []);
+  if (!adminIds.includes(userId)) throw new Error('Only admins can add members');
+  const current = data.participantIds || [];
+  const pd = { ...(data.participantData || {}), ...(participantDataAdditions || {}) };
+  const merged = [...new Set([...current, ...newMemberIds])];
+  await updateDoc(chatRef, {
+    participantIds: merged,
+    participantData: pd,
+    updatedAt: serverTimestamp(),
+  });
+  return merged;
+}
+
+/** Remove a member from a room. Caller must be admin. Cannot remove owner. */
+export async function removeRoomMember(chatId, userId, memberIdToRemove) {
+  const chatRef = doc(db, 'chats', chatId);
+  const chatSnap = await getDoc(chatRef);
+  if (!chatSnap.exists()) throw new Error('Room not found');
+  const data = chatSnap.data();
+  const adminIds = data.adminIds || (data.ownerId ? [data.ownerId] : []);
+  if (!adminIds.includes(userId)) throw new Error('Only admins can remove members');
+  if (data.ownerId === memberIdToRemove) throw new Error('Cannot remove group creator');
+  const current = data.participantIds || [];
+  const pd = { ...(data.participantData || {}) };
+  delete pd[memberIdToRemove];
+  const merged = current.filter((id) => id !== memberIdToRemove);
+  const newAdminIds = (adminIds || []).filter((id) => id !== memberIdToRemove);
+  await updateDoc(chatRef, {
+    participantIds: merged,
+    participantData: pd,
+    adminIds: newAdminIds,
+    updatedAt: serverTimestamp(),
+  });
+  return merged;
+}
+
+/** Add or remove admin. Caller must be admin (or owner for demote). */
+export async function updateRoomAdmin(chatId, userId, targetUserId, makeAdmin) {
+  const chatRef = doc(db, 'chats', chatId);
+  const chatSnap = await getDoc(chatRef);
+  if (!chatSnap.exists()) throw new Error('Room not found');
+  const data = chatSnap.data();
+  const adminIds = [...(data.adminIds || (data.ownerId ? [data.ownerId] : []))];
+  const participantIds = data.participantIds || [];
+  if (!participantIds.includes(targetUserId)) throw new Error('User is not in this group');
+  if (!adminIds.includes(userId)) throw new Error('Only admins can change admin status');
+  if (makeAdmin) {
+    if (!adminIds.includes(targetUserId)) adminIds.push(targetUserId);
+  } else {
+    if (data.ownerId === targetUserId) throw new Error('Cannot remove group creator as admin');
+    if (userId !== data.ownerId) throw new Error('Only group creator can demote admins');
+    adminIds.splice(adminIds.indexOf(targetUserId), 1);
+  }
+  await updateDoc(chatRef, { adminIds, updatedAt: serverTimestamp() });
+  return adminIds;
 }
 
 export async function getOrCreateChat(params) {
@@ -188,6 +313,13 @@ export function subscribeMessages(chatId, callback) {
   });
 }
 
+/** Subscribe to chat doc for lastReadAt (read receipts). */
+export function subscribeToChatDoc(chatId, callback) {
+  return onSnapshot(doc(db, 'chats', chatId), (snap) => {
+    if (snap.exists()) callback({ $id: snap.id, ...snap.data() });
+  });
+}
+
 export async function createMessage(input) {
   const chatRef = doc(db, 'chats', input.chatId);
   const chatSnap = await getDoc(chatRef);
@@ -206,6 +338,7 @@ export async function createMessage(input) {
     language: input.language,
     type: input.type,
     imageUrl: input.imageUrl || null,
+    audioUrl: input.audioUrl || null,
     senderDisplayName: input.senderDisplayName || null,
     createdAt: serverTimestamp(),
   };
@@ -283,7 +416,7 @@ export async function clearChat(chatId) {
   });
 }
 
-/** Mark a chat as read for a user (reset unread count). */
+/** Mark a chat as read for a user (reset unread count, update lastReadAt for read receipts). */
 export async function markChatRead(chatId, userId) {
   const chatRef = doc(db, 'chats', chatId);
   const snap = await getDoc(chatRef);
@@ -291,10 +424,25 @@ export async function markChatRead(chatId, userId) {
   const data = snap.data();
   const unreadCounts = { ...(data.unreadCounts || {}) };
   unreadCounts[userId] = 0;
+  const lastReadAt = { ...(data.lastReadAt || {}), [userId]: serverTimestamp() };
   await updateDoc(chatRef, {
     unreadCounts,
+    lastReadAt,
     updatedAt: serverTimestamp(),
   });
+}
+
+/** Get mute setting for a chat (per-user). */
+export async function getChatMute(userId, chatId) {
+  const ref = doc(db, 'users', userId, 'chatSettings', chatId);
+  const snap = await getDoc(ref);
+  return snap.exists() && !!snap.data().muted;
+}
+
+/** Set mute for a chat (per-user). Used for group notification settings. */
+export async function setChatMute(userId, chatId, muted) {
+  const ref = doc(db, 'users', userId, 'chatSettings', chatId);
+  await setDoc(ref, { muted: !!muted, updatedAt: serverTimestamp() }, { merge: true });
 }
 
 export async function addMessageReaction(chatId, messageId, userId, emoji) {
@@ -449,4 +597,67 @@ export async function searchUsersByDisplayName(searchTerm, currentUserId) {
         u.displayName?.toLowerCase().includes(term) ||
         u.email?.toLowerCase().includes(term)
     );
+}
+
+/** Create a call invitation (ringing). Returns { callId, roomName }. */
+export async function createCall(params) {
+  const { fromUserId, fromDisplayName, targetParticipantIds, targetChatId, isRoom, mode } = params;
+  if (!targetParticipantIds?.length) {
+    throw new Error('targetParticipantIds is required and must not be empty');
+  }
+  const roomName = `bakchod-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const docRef = await addDoc(collection(db, 'calls'), {
+    fromUserId,
+    fromDisplayName: fromDisplayName || 'Someone',
+    targetParticipantIds: targetParticipantIds || [],
+    targetChatId: targetChatId || null,
+    isRoom: !!isRoom,
+    mode: mode || 'video',
+    status: 'ringing',
+    roomName,
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  });
+  if (typeof window !== 'undefined' && import.meta?.env?.DEV) {
+    console.log('[createCall]', { callId: docRef.id, roomName, targetParticipantIds, fromUserId });
+  }
+  return { callId: docRef.id, roomName };
+}
+
+/** Update call status (accepted, declined, cancelled, ended). */
+export async function updateCallStatus(callId, status) {
+  const callRef = doc(db, 'calls', callId);
+  await updateDoc(callRef, { status, updatedAt: serverTimestamp() });
+}
+
+/** Subscribe to a specific call (for caller to know when accepted/declined). */
+export function subscribeToCallStatus(callId, callback) {
+  return onSnapshot(doc(db, 'calls', callId), (snap) => {
+    if (snap.exists()) callback({ $id: snap.id, ...snap.data() });
+  });
+}
+
+/** Subscribe to incoming calls for the current user. */
+export function subscribeToIncomingCalls(userId, callback) {
+  if (!userId) return () => {};
+  const q = query(
+    collection(db, 'calls'),
+    where('targetParticipantIds', 'array-contains', userId),
+    limit(10)
+  );
+  return onSnapshot(
+    q,
+    (snap) => {
+      const all = snap.docs.map((d) => ({ $id: d.id, ...d.data() }));
+      const calls = all.filter((c) => c.status === 'ringing');
+      if (typeof window !== 'undefined' && import.meta?.env?.DEV && all.length > 0) {
+        console.log('[subscribeToIncomingCalls]', { userId, total: all.length, ringing: calls.length, calls: calls.map((c) => ({ id: c.$id, from: c.fromDisplayName })) });
+      }
+      callback(calls);
+    },
+    (err) => {
+      console.error('subscribeToIncomingCalls error:', err);
+      callback([]);
+    }
+  );
 }
