@@ -1,6 +1,6 @@
 import { useMemo } from 'react';
 
-function StoryBar({ searchQuery = '', users, onSelectUser, onStartCall }) {
+function StoryBar({ searchQuery = '', users, onSelectUser, onStartCall, callsEnabled = false }) {
   const filteredUsers = useMemo(() => {
     if (!searchQuery) return users;
     return users.filter((user) =>
@@ -39,7 +39,7 @@ function StoryBar({ searchQuery = '', users, onSelectUser, onStartCall }) {
                 <div className="absolute bottom-0.5 right-0.5 size-2 rounded-full bg-green-500 border border-night-black" />
               )}
             </div>
-            {user.id !== '1' && onStartCall && (
+            {user.id !== '1' && callsEnabled && onStartCall && (
               <div className="flex gap-0.5 mt-0.5">
                 <button type="button" onClick={(e) => { e.stopPropagation(); onStartCall(user, 'audio'); }} className="size-6 rounded-full bg-white/10 flex items-center justify-center text-accent-red hover:bg-accent-red hover:text-white transition-all" title="Voice call">
                   <span className="material-symbols-outlined text-xs">call</span>

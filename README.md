@@ -1,3 +1,17 @@
+# Bakchod – Messaging App
+
+React + Firebase chat app with vibes, roasts, groups, and more.
+
+## Setup
+
+### 1. Firebase
+Copy `.env.example` to `.env` and add your Firebase config from [Firebase Console](https://console.firebase.google.com) → Project Settings → General.
+
+### 2. GIF Search (optional)
+For GIF search in chat, add a GIPHY API key. See **[GIPHY_SETUP.md](./GIPHY_SETUP.md)** for steps.
+
+---
+
 # React + Vite
 
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.

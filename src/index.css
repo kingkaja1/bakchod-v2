@@ -53,6 +53,18 @@ body {
   display: none;
 }
 
+/* Emoji picker dark theme overrides */
+.EmojiPickerReact {
+  --epr-bg-color: #110221 !important;
+  --epr-category-icon-bg-color: rgba(255, 0, 60, 0.15) !important;
+  --epr-hover-bg-color: rgba(255, 0, 60, 0.2) !important;
+  --epr-active-skin-tone-bg-color: rgba(255, 0, 60, 0.3) !important;
+  --epr-search-input-bg-color: rgba(255, 255, 255, 0.05) !important;
+  --epr-search-input-border-color: rgba(255, 0, 60, 0.3) !important;
+  --epr-search-input-text-color: #fff !important;
+  --epr-emoji-size: 1.5rem !important;
+}
+
 .vibe-gradient {
   background: radial-gradient(circle at 50% 0%, #2a0505 0%, #05010a 100%);
 }
@@ -69,4 +81,56 @@ body {
   50% {
     box-shadow: 0 0 30px rgba(255, 0, 60, 0.8);
   }
+}
+
+@keyframes borderLightBlink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.15; }
+}
+
+@keyframes pubGlowPulse {
+  0%, 100% { filter: brightness(1); }
+  50% { filter: brightness(1.4); }
+}
+
+@keyframes vibeBorderGlow {
+  0%, 100% {
+    box-shadow: inset 0 0 25px rgba(255,0,60,0.5), 0 0 50px rgba(255,0,60,0.8), 0 0 80px rgba(255,0,60,0.6), inset 0 0 40px rgba(255,0,60,0.25);
+    filter: brightness(1);
+  }
+  50% {
+    box-shadow: inset 0 0 35px rgba(255,0,60,0.7), 0 0 70px rgba(255,0,60,1), 0 0 100px rgba(255,0,60,0.8), inset 0 0 50px rgba(255,0,60,0.4);
+    filter: brightness(1.2);
+  }
+}
+
+@keyframes emojiFloatUp {
+  0% {
+    transform: translate(-50%, 0) translateY(120vh) scale(0.5) rotate(0deg);
+    opacity: 0;
+  }
+  5% {
+    opacity: 0.9;
+  }
+  15%, 85% {
+    opacity: 1;
+  }
+  50% {
+    transform: translate(calc(-50% + 8px), 0) translateY(50vh) scale(0.9) rotate(5deg);
+  }
+  100% {
+    transform: translate(calc(-50% - 5px), 0) translateY(-25vh) scale(1) rotate(-3deg);
+    opacity: 0;
+  }
+}
+
+@keyframes emojiWobble {
+  0%, 100% { transform: translate(-50%, 0) scale(1) rotate(0deg); }
+  25% { transform: translate(-50%, 0) scale(1.05) rotate(2deg); }
+  75% { transform: translate(-50%, 0) scale(0.98) rotate(-2deg); }
+}
+
+@keyframes starTwinkle {
+  0%, 100% { opacity: 0.3; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.2); }
 }

@@ -3,7 +3,7 @@ function Layout({ children, ecstasyMode }) {
     <div className="flex items-center justify-center min-h-screen p-0 sm:p-4 bg-night-black overflow-hidden">
       <div
         className={`relative flex h-[100dvh] max-h-[932px] w-full max-w-[430px] mx-auto flex-col overflow-hidden bg-night-black rounded-[3rem] transition-all duration-500 ${
-          ecstasyMode ? 'neon-frame scale-[0.98]' : 'border-4 border-white/10'
+          ecstasyMode ? 'neon-frame scale-[0.98]' : 'border-4 border-accent-red'
         }`}
       >
         {ecstasyMode && (

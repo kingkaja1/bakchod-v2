@@ -47,6 +47,12 @@ service cloud.firestore {
     match /chats/{chatId}/messages/{messageId} {
       allow read, create, update, delete: if request.auth != null && isChatParticipant(chatId, db);
     }
+    match /chats/{chatId}/userSettings/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId && canAccessChat(chatId, db);
+    }
+    match /chats/{chatId}/userDeletedMessages/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId && canAccessChat(chatId, db);
+    }
     match /chats/{chatId}/typing/{typingUserId} {
       allow read, write: if request.auth != null && canAccessChat(chatId, db);
     }

@@ -14,6 +14,7 @@ import {
   addRoomMembers,
   removeRoomMember,
   updateRoomAdmin,
+  updateRoomName,
   uploadProfilePhoto,
   getUserAvatarUrl,
   uploadGroupAvatar,
@@ -36,10 +37,15 @@ import {
   searchUsersByDisplayName,
   addContactToBackend,
   deleteMessage as deleteMessageBackend,
-  clearChat as clearChatBackend,
+  setChatClearedForMe,
+  getChatClearedAt,
+  addMessageDeletedForMe,
+  getMessagesDeletedForMe,
   markChatRead,
   getChatMute,
   setChatMute,
+  getChatRoastsEnabled,
+  setChatRoastsEnabled,
   uploadChatFile,
   createCall,
   updateCallStatus,
@@ -48,9 +54,15 @@ import {
 } from './services/backend';
 import { User, ActiveRoom, Message } from './types';
 import { registerForPushNotifications, isPushSupported } from './services/pushNotifications';
+import { playMessageNotificationSound, playVibeCelebrationSound, unlockAudioOnFirstInteraction } from './services/messageNotificationSound';
+import confetti from 'canvas-confetti';
+import EmojiPicker, { Theme } from 'emoji-picker-react';
 import JitsiCallView from './components/JitsiCallView';
 import { useUserContext } from './contexts/UserContext';
 import { useAuth } from './context/AuthContext';
+
+/** Toggle to show audio/video call icons. Set true when calls are ready. */
+const CALLS_ENABLED = false;
 
 type TabType = 'party' | 'hotline' | 'bot' | 'me';
 type CallMode = 'audio' | 'video' | null;
@@ -230,6 +242,31 @@ const QUICK_EMOJIS = [
   "🥶", "🤯", "🥺", "🤝", "🤙", "👊", "🧿", "🇮🇳"
 ];
 
+const VIBE_CELEBRATIONS: { id: string; label: string; emoji: string }[] = [
+  { id: 'baby', label: 'Birth / Baby Shower', emoji: '👶' },
+  { id: 'adoption', label: 'Adoption', emoji: '🏠' },
+  { id: 'birthday', label: 'Birthday', emoji: '🎂' },
+  { id: 'milestone', label: 'Milestone Birthday', emoji: '🍾' },
+  { id: 'graduation', label: 'Graduation', emoji: '🎓' },
+  { id: 'first-day-school', label: 'First Day of School', emoji: '🎒' },
+  { id: 'proposal', label: 'Proposal / Engagement', emoji: '💍' },
+  { id: 'wedding', label: 'Wedding', emoji: '👰' },
+  { id: 'anniversary', label: 'Anniversary', emoji: '🌹' },
+  { id: 'housewarming', label: 'Moving / Housewarming', emoji: '🏡' },
+  { id: 'renovation', label: 'Renovation', emoji: '🛠️' },
+  { id: 'new-job', label: 'New Job / Promotion', emoji: '💼' },
+  { id: 'retirement', label: 'Retirement', emoji: '🏝️' },
+  { id: 'recovery', label: 'Recovery / Get Well', emoji: '🩹' },
+  { id: 'fitness', label: 'Fitness Milestone', emoji: '🏅' },
+  { id: 'festival', label: 'Religious Festival', emoji: '🪔' },
+  { id: 'spiritual', label: 'Spiritual Milestone', emoji: '🕊️' },
+  { id: 'party', label: 'Party & Success', emoji: '🎉' },
+  { id: 'congrats', label: 'Congratulations', emoji: '🎊' },
+  { id: 'love', label: 'Love you', emoji: '❤️' },
+  { id: 'hug', label: 'Hug', emoji: '🫂' },
+  { id: 'thank-you', label: 'Thank you', emoji: '🙏' },
+];
+
 const App: React.FC = () => {
   const { appUser } = useUserContext();
   // Navigation & UI States
@@ -297,6 +334,8 @@ const App: React.FC = () => {
   // Chat History State
   const [chatMessages, setChatMessages] = useState<Record<string, Message[]>>({});
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
+  const [showVibePicker, setShowVibePicker] = useState(false);
+  const [celebrationEffect, setCelebrationEffect] = useState<string | null>(null);
   const [replyToMessage, setReplyToMessage] = useState<Message | null>(null);
   const [typingIndicators, setTypingIndicators] = useState<Array<{ userId: string; displayName?: string }>>([]);
   const [messageContextMenu, setMessageContextMenu] = useState<{ msg: Message; x: number; y: number } | null>(null);
@@ -305,9 +344,14 @@ const App: React.FC = () => {
   const [groupInfoData, setGroupInfoData] = useState<{ $id: string; name: string; ownerId: string; participantIds: string[]; participantData: Record<string, { displayName?: string }>; adminIds: string[]; avatarUrl?: string | null } | null>(null);
   const [groupInfoLoading, setGroupInfoLoading] = useState(false);
   const [groupAddMemberOpen, setGroupAddMemberOpen] = useState(false);
+  const [groupNameEdit, setGroupNameEdit] = useState<string | null>(null);
+  const [groupNameEditValue, setGroupNameEditValue] = useState('');
   const [chatLastReadAt, setChatLastReadAt] = useState<Record<string, Record<string, Date>>>({});
+  const [chatClearedAt, setChatClearedAt] = useState<Record<string, number | null>>({});
+  const [messagesDeletedForMe, setMessagesDeletedForMe] = useState<Record<string, Set<string>>>({});
   const [chatSearchQuery, setChatSearchQuery] = useState('');
   const [mutedChats, setMutedChats] = useState<Record<string, boolean>>({});
+  const [roastsEnabledChats, setRoastsEnabledChats] = useState<Record<string, boolean>>({});
   const [avatarPreview, setAvatarPreview] = useState<{ url: string; name?: string } | null>(null);
   const groupAvatarInputRef = useRef<HTMLInputElement>(null);
   const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -347,9 +391,24 @@ const App: React.FC = () => {
   const [stream, setStream] = useState<MediaStream | null>(null);
   const activeChatUnsubscribeRef = useRef<null | (() => void)>(null);
   const voiceRecorderRef = useRef<{ recorder: MediaRecorder; chunks: Blob[] } | null>(null);
+  const seenMessageIdsRef = useRef<Set<string>>(new Set());
+  const initialSnapshotHandledRef = useRef(false);
+  const mutedChatsRef = useRef<Record<string, boolean>>({});
+  const chatClearedAtRef = useRef<Record<string, number | null>>({});
+  const messagesDeletedForMeRef = useRef<Record<string, Set<string>>>({});
+  useEffect(() => { mutedChatsRef.current = mutedChats; }, [mutedChats]);
+  useEffect(() => { chatClearedAtRef.current = chatClearedAt; }, [chatClearedAt]);
+  useEffect(() => { messagesDeletedForMeRef.current = messagesDeletedForMe; }, [messagesDeletedForMe]);
+  useEffect(() => { unlockAudioOnFirstInteraction(); }, []);
 
   // AI Content State
   const [currentRoast, setCurrentRoast] = useState("Type something to get roasted! 🌶️");
+  const displayRoast = useMemo(() => {
+    if (!activeChat || roastsEnabledChats[activeChat.id] === false) return 'Roasts disabled for this chat';
+    const msgs = chatMessages[activeChat.id] || [];
+    const last = [...msgs].reverse().find((m) => m.type === 'roast');
+    return last?.text || currentRoast;
+  }, [activeChat, chatMessages, currentRoast, roastsEnabledChats]);
   const [isLoadingRoast, setIsLoadingRoast] = useState(false);
   const contactPickerSupported = typeof navigator !== 'undefined' && !!(navigator as any).contacts?.select;
 
@@ -505,6 +564,39 @@ const App: React.FC = () => {
     return () => { cancelled = true; };
   }, [recentChats, contacts, groupInfoData, currentUserId]);
 
+  // Preload messagesDeletedForMe for chat list (so we can hide "deleted for me" previews)
+  useEffect(() => {
+    if (!currentUserId || recentChats.length === 0) return;
+    let cancelled = false;
+    const load = async () => {
+      const updates: Record<string, Set<string>> = {};
+      await Promise.all(
+        recentChats.map(async (c) => {
+          const chatKey = c.isRoom ? c.$id : (c.participantIds?.find((p) => p !== currentUserId) || c.externalId || c.$id);
+          if (!chatKey) return;
+          try {
+            const ids = await getMessagesDeletedForMe(c.$id, currentUserId);
+            if (!cancelled && ids?.length) updates[chatKey] = new Set(ids);
+          } catch {
+            // ignore
+          }
+        })
+      );
+      if (!cancelled && Object.keys(updates).length > 0) {
+        setMessagesDeletedForMe((prev) => {
+          const next = { ...prev };
+          Object.entries(updates).forEach(([k, v]) => {
+            const existing = next[k];
+            next[k] = existing ? new Set([...existing, ...v]) : v;
+          });
+          return next;
+        });
+      }
+    };
+    void load();
+    return () => { cancelled = true; };
+  }, [currentUserId, recentChats]);
+
   // Search registered users by display name (Party tab)
   useEffect(() => {
     if (activeTab !== 'party' || !currentUserId) {
@@ -639,12 +731,27 @@ const App: React.FC = () => {
     );
   }, [searchQuery, activeTab, callHistory]);
 
-  // AI Interaction
-  const handleBotAction = async (topic: string) => {
+  // AI Interaction - in chat: saves roast to Firestore so both users see it; in Bot tab: local only
+  const handleBotAction = async (topic: string, firestoreChatId?: string) => {
     if (isLoadingRoast || !topic.trim()) return;
     setIsLoadingRoast(true);
     const roast = await generateRoast(topic);
     setCurrentRoast(roast);
+    if (firestoreChatId) {
+      try {
+        await createMessage({
+          chatId: firestoreChatId,
+          userId: 'ecstasy-bot',
+          role: 'bot',
+          content: roast,
+          type: 'roast',
+          senderDisplayName: 'ECSTASY BOT',
+          lastSenderDisplayName: 'ECSTASY BOT',
+        });
+      } catch (err) {
+        console.error('Failed to save roast message:', err);
+      }
+    }
     setIsLoadingRoast(false);
   };
 
@@ -741,10 +848,13 @@ const App: React.FC = () => {
       window.alert('Chat not loaded yet. Wait a moment and try again.');
       return;
     }
-    if (!window.confirm(`Clear all messages in this ${activeChat.isRoom ? 'tribe' : 'chat'}? This cannot be undone.`)) return;
+    if (!window.confirm(`Clear chat for you only? Messages will remain for others.`)) return;
     setChatMenuOpen(false);
     try {
-      await clearChatBackend(fid);
+      await setChatClearedForMe(fid, currentUserId);
+      const now = Date.now();
+      setChatClearedAt((prev) => ({ ...prev, [activeChat.id]: now }));
+      chatClearedAtRef.current = { ...chatClearedAtRef.current, [activeChat.id]: now };
       setChatMessages((prev) => ({ ...prev, [activeChat.id]: [] }));
     } catch (err: any) {
       const msg = err?.message || 'Failed to clear chat.';
@@ -756,12 +866,12 @@ const App: React.FC = () => {
     }
   };
 
-  const handleDeleteMessage = async (msg: Message) => {
+  const handleDeleteForEveryone = async (msg: Message) => {
     if (!activeChat || !currentUserId) return;
     const fid = chatDocIds[activeChat.id] || (activeChat.isRoom ? activeChat.id : null);
     if (!fid) return;
     setMessageContextMenu(null);
-    if (!window.confirm('Delete this message?')) return;
+    if (!window.confirm('Delete this message for everyone?')) return;
     try {
       await deleteMessageBackend(fid, msg.id);
       setChatMessages((prev) => ({
@@ -770,6 +880,25 @@ const App: React.FC = () => {
       }));
     } catch (err: any) {
       window.alert(err?.message || 'Failed to delete message.');
+    }
+  };
+
+  const handleDeleteForMe = async (msg: Message) => {
+    if (!activeChat || !currentUserId) return;
+    const fid = chatDocIds[activeChat.id] || (activeChat.isRoom ? activeChat.id : null);
+    if (!fid) return;
+    setMessageContextMenu(null);
+    try {
+      await addMessageDeletedForMe(fid, currentUserId, msg.id);
+      const newSet = new Set([...(messagesDeletedForMe[activeChat.id] || []), msg.id]);
+      setMessagesDeletedForMe((prev) => ({ ...prev, [activeChat.id]: newSet }));
+      messagesDeletedForMeRef.current = { ...messagesDeletedForMeRef.current, [activeChat.id]: newSet };
+      setChatMessages((prev) => ({
+        ...prev,
+        [activeChat.id]: (prev[activeChat.id] || []).filter((m) => m.id !== msg.id),
+      }));
+    } catch (err: any) {
+      window.alert(err?.message || 'Failed to remove message.');
     }
   };
 
@@ -788,6 +917,9 @@ const App: React.FC = () => {
       activeChatUnsubscribeRef.current();
       activeChatUnsubscribeRef.current = null;
     }
+    seenMessageIdsRef.current = new Set();
+    initialSnapshotHandledRef.current = false;
+    const subscriptionTime = Date.now();
 
     const toDate = (value: any) => {
       if (!value) return new Date();
@@ -803,6 +935,18 @@ const App: React.FC = () => {
       // ignore
     }
     void markChatRead(firestoreChatId, currentUserId);
+    try {
+      const [clearedAt, deletedIds] = await Promise.all([
+        getChatClearedAt(firestoreChatId, currentUserId),
+        getMessagesDeletedForMe(firestoreChatId, currentUserId),
+      ]);
+      setChatClearedAt((prev) => ({ ...prev, [chatId]: clearedAt }));
+      setMessagesDeletedForMe((prev) => ({ ...prev, [chatId]: new Set(deletedIds || []) }));
+      chatClearedAtRef.current = { ...chatClearedAtRef.current, [chatId]: clearedAt };
+      messagesDeletedForMeRef.current = { ...messagesDeletedForMeRef.current, [chatId]: new Set(deletedIds || []) };
+    } catch {
+      // ignore
+    }
     activeChatUnsubscribeRef.current = subscribeMessages(firestoreChatId, (payload) => {
       const mapped: Message[] = payload.documents.map((doc: any) => {
         const sid = doc.senderId || doc.userId;
@@ -822,7 +966,38 @@ const App: React.FC = () => {
           createdAt,
         };
       });
-      setChatMessages(prev => ({ ...prev, [chatId]: mapped }));
+      const seen = seenMessageIdsRef.current;
+      const isInitialLoad = !initialSnapshotHandledRef.current;
+      if (payload.documents.length > 0 && !initialSnapshotHandledRef.current) initialSnapshotHandledRef.current = true;
+      const createdAfterSubscribe = (d: any) => toDate(d.createdAt).getTime() > subscriptionTime - 2000;
+      const newFromOther = payload.documents.filter((d: any) => {
+        const sid = d.senderId || d.userId;
+        const fromOther = sid !== currentUserId && sid !== 'ecstasy-bot';
+        return !seen.has(d.$id) && fromOther && createdAfterSubscribe(d);
+      });
+      const hasNewFromOther = newFromOther.length > 0;
+      if (!isInitialLoad && hasNewFromOther && !mutedChatsRef.current[chatId]) {
+        playMessageNotificationSound();
+      }
+      if (!isInitialLoad && hasNewFromOther) {
+        const vibeMatches = newFromOther.filter((d: any) =>
+          VIBE_CELEBRATIONS.some((v) => d.content === `${v.emoji} ${v.label}`)
+        );
+        const latestVibe = vibeMatches[vibeMatches.length - 1];
+        if (latestVibe) {
+          const item = VIBE_CELEBRATIONS.find((v) => latestVibe.content === `${v.emoji} ${v.label}`);
+          if (item) setCelebrationEffect(item.emoji);
+        }
+      }
+      payload.documents.forEach((d: any) => seen.add(d.$id));
+      const clearedAt = chatClearedAtRef.current[chatId];
+      const deletedSet = messagesDeletedForMeRef.current[chatId];
+      const filtered = mapped.filter((m) => {
+        if (clearedAt != null && m.createdAt && m.createdAt.getTime() <= clearedAt) return false;
+        if (deletedSet?.has(m.id)) return false;
+        return true;
+      });
+      setChatMessages(prev => ({ ...prev, [chatId]: filtered }));
     });
     if (chatDocUnsubRef.current) chatDocUnsubRef.current();
     chatDocUnsubRef.current = subscribeToChatDoc(firestoreChatId, (chatData: any) => {
@@ -842,6 +1017,9 @@ const App: React.FC = () => {
     getChatMute(currentUserId, firestoreChatId).then((muted) => {
       setMutedChats((prev) => ({ ...prev, [chatId]: muted }));
     }).catch(() => {});
+    getChatRoastsEnabled(currentUserId, firestoreChatId).then((enabled) => {
+      setRoastsEnabledChats((prev) => ({ ...prev, [chatId]: enabled }));
+    }).catch(() => {});
     if (typingUnsubRef.current) typingUnsubRef.current();
     typingUnsubRef.current = subscribeTyping(firestoreChatId, (typers) => {
       setTypingIndicators(typers.filter((t) => t.userId !== currentUserId));
@@ -850,6 +1028,7 @@ const App: React.FC = () => {
 
   useEffect(() => {
     if (activeChat) return;
+    setCelebrationEffect(null);
     if (activeChatUnsubscribeRef.current) {
       activeChatUnsubscribeRef.current();
       activeChatUnsubscribeRef.current = null;
@@ -907,6 +1086,35 @@ const App: React.FC = () => {
       if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
     };
   }, [chatInput, activeChat, currentUserId, displayName, chatDocIds]);
+
+
+  useEffect(() => {
+    if (!celebrationEffect) return;
+    if (navigator.vibrate) navigator.vibrate([80, 40, 80]);
+    playVibeCelebrationSound();
+    const duration = 3000;
+    const end = Date.now() + duration;
+    const frame = () => {
+      confetti({
+        particleCount: 3,
+        angle: 60,
+        spread: 55,
+        origin: { x: 0, y: 0.6 },
+        colors: ['#ff003c', '#ff00a0', '#ffeb3b', '#76ff03'],
+      });
+      confetti({
+        particleCount: 3,
+        angle: 120,
+        spread: 55,
+        origin: { x: 1, y: 0.6 },
+        colors: ['#ff003c', '#ff00a0', '#ffeb3b', '#76ff03'],
+      });
+      if (Date.now() < end) requestAnimationFrame(frame);
+    };
+    frame();
+    const t = setTimeout(() => setCelebrationEffect(null), 10000);
+    return () => { clearTimeout(t); };
+  }, [celebrationEffect]);
 
   const handleSendMessage = async (text: string, type: 'text' | 'image' | 'video' | 'file' | 'audio' | 'roast' = 'text', options?: { imageUrl?: string; fileName?: string; audioUrl?: string }) => {
     const mediaUrl = options?.imageUrl ?? options?.audioUrl;
@@ -995,6 +1203,9 @@ const App: React.FC = () => {
         if (activeChat && chatDocIds[activeChat.id]) {
           void setTyping(chatDocIds[activeChat.id], currentUserId!, displayName || 'You', false);
         }
+        if (type === 'text' && roastsEnabledChats[activeChat.id] !== false) {
+          handleBotAction(text, chatDoc.$id);
+        }
       } catch (err) {
         setChatMessages(prev => ({
           ...prev,
@@ -1005,10 +1216,13 @@ const App: React.FC = () => {
         return;
       }
     }
+  };
 
-    if (type === 'text') {
-      handleBotAction(text);
-    }
+  const handleSendVibe = (item: typeof VIBE_CELEBRATIONS[0]) => {
+    setCelebrationEffect(item.emoji);
+    setShowVibePicker(false);
+    setShowEmojiPicker(false);
+    handleSendMessage(`${item.emoji} ${item.label}`);
   };
 
   const toggleVoiceRecording = async () => {
@@ -1883,9 +2097,9 @@ const App: React.FC = () => {
       const messagesLoaded = activeChat.id in chatMessages;
       const rawMessages = chatMessages[activeChat.id] || [];
       const chatSearch = (chatSearchQuery || '').trim().toLowerCase();
-      const messages = chatSearch
+      const messages = (chatSearch
         ? rawMessages.filter((m) => (m.text || '').toLowerCase().includes(chatSearch))
-        : rawMessages;
+        : rawMessages).filter((m) => m.type !== 'roast');
       const lastReadByChat = chatLastReadAt[activeChat.id] || {};
       const otherUserIds = activeChat.isRoom
         ? (groupInfoData?.participantIds || []).filter((id) => id !== currentUserId)
@@ -1898,9 +2112,9 @@ const App: React.FC = () => {
         });
       };
       return (
-        <div className="flex-1 flex flex-col h-full bg-night-black">
+        <div className="flex-1 flex flex-col h-full bg-night-black border-2 border-accent-red rounded-xl shadow-[0_0_20px_rgba(255,0,60,0.3)] overflow-hidden">
           {/* Contact Header */}
-          <div className="flex items-center gap-2 p-3 border-b border-white/5 bg-night-panel/30 flex-wrap">
+          <div className="flex items-center gap-2 p-3 border-b border-accent-red/30 bg-night-panel/30 flex-wrap">
             <button onClick={() => {
               if (activeChat && currentUserId && (chatDocIds[activeChat.id] || (activeChat.isRoom && activeChat.id))) {
                 const fid = chatDocIds[activeChat.id] || activeChat.id;
@@ -1917,7 +2131,7 @@ const App: React.FC = () => {
             />
             <div className="flex-1 min-w-0">
               <h2
-                className={`text-[12px] font-bold text-white truncate ${activeChat.isRoom ? 'cursor-pointer' : ''}`}
+                className={`text-sm font-bold text-white truncate ${activeChat.isRoom ? 'cursor-pointer' : ''}`}
                 onClick={activeChat.isRoom ? async () => {
                   setGroupInfoOpen(true);
                   setGroupInfoLoading(true);
@@ -1932,7 +2146,7 @@ const App: React.FC = () => {
               >
                 {activeChat.name}
               </h2>
-              <p className="text-[8px] text-accent-red uppercase font-bold tracking-tighter">
+              <p className="text-[10px] text-accent-red uppercase font-bold tracking-tighter">
                 {isCalling
                   ? (callMode === 'video' ? 'Video Calling...' : 'Voice Calling...')
                   : activeChat.isRoom
@@ -1952,8 +2166,8 @@ const App: React.FC = () => {
                       })()}
               </p>
             </div>
-            {/* Voice & Video - always visible when not in call, for both 1:1 and group */}
-            {!isCalling && (
+            {/* Voice & Video - hidden until CALLS_ENABLED */}
+            {CALLS_ENABLED && !isCalling && (
               <div className="flex gap-1.5 shrink-0" role="group" aria-label="Call options">
                 <button type="button" onClick={() => startCall('audio')} className="size-9 rounded-full bg-white/10 flex items-center justify-center text-white hover:bg-white/20 transition-all active:scale-95" title={activeChat.isRoom ? 'Voice call tribe' : 'Voice call'}>
                   <span className="material-symbols-outlined text-lg">call</span>
@@ -1988,7 +2202,7 @@ const App: React.FC = () => {
                 placeholder="Search..."
                 value={chatSearchQuery}
                 onChange={(e) => setChatSearchQuery(e.target.value)}
-                className="w-20 min-w-0 flex-1 max-w-[100px] bg-white/5 border border-white/10 rounded-lg px-2 py-1 text-[10px] text-white placeholder:text-white/40 focus:outline-none focus:border-accent-red/50"
+                className="w-20 min-w-0 flex-1 max-w-[100px] bg-white/5 border border-white/10 rounded-lg px-2 py-1 text-xs text-white placeholder:text-white/40 focus:outline-none focus:border-accent-red/50"
               />
             </div>
             <div className="relative">
@@ -2015,9 +2229,25 @@ const App: React.FC = () => {
                       <span className="material-symbols-outlined text-base">{mutedChats[activeChat.id] ? 'notifications_off' : 'notifications'}</span>
                       {mutedChats[activeChat.id] ? 'Unmute' : 'Mute'} notifications
                     </button>
+                    <button
+                      onClick={async () => {
+                        const fid = chatDocIds[activeChat.id] || (activeChat.isRoom ? activeChat.id : null);
+                        if (!fid || !currentUserId) return;
+                        const next = roastsEnabledChats[activeChat.id] === false;
+                        try {
+                          await setChatRoastsEnabled(currentUserId, fid, next);
+                          setRoastsEnabledChats((prev) => ({ ...prev, [activeChat.id]: next }));
+                        } catch { /* ignore */ }
+                        setChatMenuOpen(false);
+                      }}
+                      className="w-full px-4 py-2.5 text-left text-[11px] font-bold text-white hover:bg-accent-red/20 flex items-center gap-2"
+                    >
+                      <span className="material-symbols-outlined text-base">local_fire_department</span>
+                      {roastsEnabledChats[activeChat.id] === false ? 'Enable' : 'Disable'} roasts
+                    </button>
                     <button onClick={handleClearChat} className="w-full px-4 py-2.5 text-left text-[11px] font-bold text-white hover:bg-accent-red/20 flex items-center gap-2">
                       <span className="material-symbols-outlined text-base">delete_sweep</span>
-                      Clear chat
+                      Clear chat (for me only)
                     </button>
                   </div>
                 </>
@@ -2084,12 +2314,17 @@ const App: React.FC = () => {
                       className={`flex flex-col ${msg.senderId === currentUserId ? 'items-end' : 'items-start'} group`}
                       onContextMenu={(e) => { e.preventDefault(); setMessageContextMenu({ msg, x: Math.min(e.clientX, window.innerWidth - 160), y: e.clientY }); }}
                     >
-                      {activeChat.isRoom && (
-                        <span className={`text-[9px] font-bold text-accent-red/80 mb-0.5 px-1 ${msg.senderId === currentUserId ? 'text-right' : 'text-left'}`}>
+                      {activeChat.isRoom && msg.type !== 'roast' && (
+                        <span className={`text-[10px] font-bold text-accent-red/80 mb-0.5 px-1 ${msg.senderId === currentUserId ? 'text-right' : 'text-left'}`}>
                           {msg.senderId === currentUserId ? 'You' : (msg.senderName || 'Unknown')}
                         </span>
                       )}
-                      <div className={`max-w-[75%] px-4 py-2.5 rounded-2xl text-[11px] leading-snug relative ${msg.senderId === currentUserId ? 'bg-accent-red text-white rounded-tr-none shadow-lg' : 'bg-white/5 text-white/80 rounded-tl-none border border-white/10'}`}>
+                      {msg.type === 'roast' && (
+                        <span className="text-[10px] font-bold text-accent-red/80 mb-0.5 px-1 text-left">
+                          ECSTASY BOT
+                        </span>
+                      )}
+                      <div className={`max-w-[75%] px-4 py-2.5 rounded-2xl text-[13px] leading-snug relative ${msg.type === 'roast' ? 'bg-accent-red/10 text-accent-red rounded-tl-none border-l-4 border-accent-red' : msg.senderId === currentUserId ? 'bg-accent-red text-white rounded-tr-none shadow-lg' : 'bg-white/5 text-white/80 rounded-tl-none border border-white/10'}`}>
                         {msg.replyTo && (
                           <div className={`mb-1.5 pl-2 border-l-2 ${msg.senderId === currentUserId ? 'border-white/40' : 'border-accent-red/40'}`}>
                             <p className="text-[9px] font-bold opacity-90">{msg.replyTo.senderName}</p>
@@ -2134,7 +2369,7 @@ const App: React.FC = () => {
                         )}
                       </div>
                       <div className="flex items-center gap-2 mt-1 px-1">
-                        <span className="text-[8px] text-gray-600">{msg.timestamp}</span>
+                        <span className="text-[10px] text-gray-600">{msg.timestamp}</span>
                         {msg.senderId === currentUserId && (
                           <span className="text-[10px] flex items-center" title={isRead(msg) ? 'Read' : 'Sent'}>
                             {isRead(msg) ? (
@@ -2175,15 +2410,15 @@ const App: React.FC = () => {
                 <div className="glass-card rounded-xl p-3 border-l-4 border-accent-red pointer-events-auto shadow-[0_-5px_30px_rgba(0,0,0,0.6)]">
                     <div className="flex items-center gap-2 mb-1.5">
                         <span className="material-symbols-outlined text-accent-red text-base">smart_toy</span>
-                        <span className="text-accent-red text-[9px] font-bold uppercase tracking-wider">ECSTASY BOT BURN</span>
+                        <span className="text-accent-red text-[10px] font-bold uppercase tracking-wider">ECSTASY BOT BURN</span>
                         {isLoadingRoast && <div className="ml-auto flex gap-1"><div className="size-1 rounded-full bg-accent-red animate-bounce" /><div className="size-1 rounded-full bg-accent-red animate-bounce [animation-delay:0.2s]" /><div className="size-1 rounded-full bg-accent-red animate-bounce [animation-delay:0.4s]" /></div>}
                     </div>
-                    <p className="text-white text-[11px] italic leading-tight">"{isLoadingRoast ? "Analyzing your bakchodi..." : currentRoast}"</p>
+                    <p className="text-accent-red text-[13px] italic leading-tight">"{isLoadingRoast ? "Analyzing your bakchodi..." : displayRoast}"</p>
                 </div>
             </div>
           </div>
 
-          <div className="p-3 bg-night-black border-t border-white/5 space-y-2">
+          <div className="p-3 bg-night-black border-t border-accent-red/30 space-y-2">
             {replyToMessage && (
               <div className="flex items-center justify-between bg-accent-red/10 border border-accent-red/30 rounded-xl px-3 py-2">
                 <div className="flex-1 min-w-0">
@@ -2196,20 +2431,20 @@ const App: React.FC = () => {
               </div>
             )}
             {showEmojiPicker && (
-              <div className="bg-night-panel border-2 border-accent-red rounded-2xl p-2 animate-in slide-in-from-bottom-2 shadow-[0_0_30px_rgba(255,0,60,0.4)]">
-                <div className="grid grid-cols-8 gap-2 max-h-[180px] overflow-y-auto no-scrollbar">
-                  {QUICK_EMOJIS.map(emoji => (
-                    <button 
-                      key={emoji} 
-                      onClick={() => { handleSendMessage(emoji); }} 
-                      className="text-2xl hover:scale-125 transition-transform active:scale-90 flex items-center justify-center aspect-square"
-                    >
-                      {emoji}
-                    </button>
-                  ))}
+              <div className="bg-night-panel border-2 border-accent-red rounded-2xl overflow-hidden animate-in slide-in-from-bottom-2 shadow-[0_0_30px_rgba(255,0,60,0.4)]">
+                <div className="p-1 max-h-[320px] overflow-hidden [&_.EmojiPickerReact]:!shadow-none [&_.EmojiPickerReact]:!bg-transparent">
+                  <EmojiPicker
+                    theme={Theme.DARK}
+                    width="100%"
+                    height={320}
+                    searchPlaceHolder="Search emoji"
+                    onEmojiClick={(data) => setChatInput((prev) => prev + data.emoji)}
+                    emojiStyle="native"
+                    previewConfig={{ showPreview: false }}
+                  />
                 </div>
-                <div className="mt-2 pt-2 border-t border-white/5 flex justify-center">
-                    <button onClick={() => setShowEmojiPicker(false)} className="text-[10px] text-accent-red font-bold uppercase tracking-widest">Close Picker</button>
+                <div className="p-2 border-t border-white/5">
+                  <button onClick={() => setShowEmojiPicker(false)} className="w-full py-1.5 text-[10px] text-accent-red font-bold uppercase tracking-widest">Close</button>
                 </div>
               </div>
             )}
@@ -2233,7 +2468,7 @@ const App: React.FC = () => {
               }
             }} />
             <form onSubmit={(e) => { e.preventDefault(); if (chatInput.trim()) { handleSendMessage(chatInput); setChatInput(""); } }} className="flex items-center gap-2 bg-accent-red/5 border-2 border-accent-red rounded-xl px-3 h-11 group focus-within:ring-2 focus:ring-accent-red/30 transition-all">
-              <button type="button" onClick={() => setShowEmojiPicker(!showEmojiPicker)} className={`text-accent-red/60 hover:text-accent-red transition-colors ${showEmojiPicker ? 'text-accent-red' : ''}`}>
+              <button type="button" onClick={() => { setShowEmojiPicker(!showEmojiPicker); setShowVibePicker(false); }} className={`text-accent-red/60 hover:text-accent-red transition-colors ${showEmojiPicker ? 'text-accent-red' : ''}`}>
                 <span className="material-symbols-outlined text-xl">mood</span>
               </button>
               <button type="button" onClick={() => chatAttachRef.current?.click()} disabled={isUploadingMedia} className="text-accent-red/60 hover:text-accent-red disabled:opacity-50 transition-colors" title="Attach photo, video or file">
@@ -2246,12 +2481,68 @@ const App: React.FC = () => {
                 value={chatInput}
                 onChange={(e) => setChatInput(e.target.value)}
                 placeholder="Say something savage..." 
-                className="bg-transparent border-none focus:outline-none focus:ring-0 text-[12px] flex-1 text-white h-full p-0 placeholder:text-gray-500 font-bold" 
+                className="bg-transparent border-none focus:outline-none focus:ring-0 text-sm flex-1 text-white h-full p-0 placeholder:text-gray-500 font-bold min-w-0" 
               />
-              <button type="submit" disabled={!chatInput.trim()} className="text-accent-red disabled:opacity-30 hover:scale-110 active:scale-90 transition-transform drop-shadow-[0_0_5px_rgba(255,0,60,0.5)]">
+              <button type="submit" disabled={!chatInput.trim()} className="text-accent-red disabled:opacity-30 hover:scale-110 active:scale-90 transition-transform drop-shadow-[0_0_5px_rgba(255,0,60,0.5)] shrink-0">
                 <span className="material-symbols-outlined text-2xl font-bold">send</span>
               </button>
+              <button type="button" onClick={() => { setShowVibePicker(!showVibePicker); setShowEmojiPicker(false); }} className={`shrink-0 transition-colors ${showVibePicker ? 'text-accent-red' : 'text-accent-red/60 hover:text-accent-red'}`} title="Vibe">
+                <span className="material-symbols-outlined text-xl">celebration</span>
+              </button>
             </form>
+            {/* Vibe picker - inline under form, only when open */}
+            {showVibePicker && (
+              <div className="bg-night-panel border-2 border-accent-red rounded-xl p-2 mt-1.5 shadow-[0_0_20px_rgba(255,0,60,0.3)]">
+                <div className="grid grid-cols-5 gap-1.5 max-h-[160px] overflow-y-auto no-scrollbar">
+                  {VIBE_CELEBRATIONS.map((item) => (
+                    <button
+                      key={item.id}
+                      type="button"
+                      onClick={() => handleSendVibe(item)}
+                      className="flex flex-col items-center gap-0.5 p-2 rounded-xl bg-white/5 border border-white/10 hover:bg-accent-red/20 hover:border-accent-red/50 transition-all active:scale-95"
+                    >
+                      <span className="text-lg">{item.emoji}</span>
+                      <span className="text-[8px] font-bold text-white/90 truncate w-full text-center">{item.label}</span>
+                    </button>
+                  ))}
+                </div>
+                <button type="button" onClick={() => setShowVibePicker(false)} className="mt-1.5 w-full py-1 text-[9px] text-accent-red font-bold uppercase tracking-widest">
+                  Close
+                </button>
+              </div>
+            )}
+            {/* Full-screen celebration: strong border glow + confetti + emoji float */}
+            {celebrationEffect && (
+              <div className="fixed inset-0 z-[100] pointer-events-none overflow-hidden" aria-hidden>
+                {/* Strong vibrant red border with pulsing glow */}
+                <div
+                  className="absolute inset-0 rounded-[3rem] border-4 border-accent-red"
+                  style={{ animation: 'vibeBorderGlow 1.2s ease-in-out infinite' }}
+                />
+                {/* Emojis floating up - polished with varied sizes and drift */}
+                {Array.from({ length: 40 }).map((_, i) => {
+                  const x = 3 + (i % 11) * 8.5 + (i % 2) * 2;
+                  const duration = 5 + (i % 5) * 0.6;
+                  const delay = (i * 0.35) % 9;
+                  const size = 10 + (i % 4) * 3;
+                  return (
+                    <div
+                      key={i}
+                      className="absolute bottom-0 left-0 text-center origin-center"
+                      style={{
+                        left: `${x}%`,
+                        fontSize: size,
+                        filter: 'drop-shadow(0 0 6px rgba(255,255,255,0.6)) drop-shadow(0 0 12px rgba(255,0,60,0.3))',
+                        animation: `emojiFloatUp ${duration}s cubic-bezier(0.25, 0.46, 0.45, 0.94) infinite`,
+                        animationDelay: `${delay}s`,
+                      }}
+                    >
+                      {celebrationEffect}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
             {messageContextMenu && (
               <>
                 <div className="fixed inset-0 z-40" onClick={() => setMessageContextMenu(null)} />
@@ -2262,9 +2553,18 @@ const App: React.FC = () => {
                   <button onClick={() => { navigator.clipboard?.writeText(messageContextMenu.msg.text); setMessageContextMenu(null); }} className="w-full px-4 py-2 text-left text-[11px] font-bold text-white hover:bg-accent-red/20 flex items-center gap-2">
                     <span className="material-symbols-outlined text-base">content_copy</span> Copy
                   </button>
-                  {messageContextMenu.msg.senderId === currentUserId && (
-                    <button onClick={() => handleDeleteMessage(messageContextMenu.msg)} className="w-full px-4 py-2 text-left text-[11px] font-bold text-vibrant-pink hover:bg-accent-red/20 flex items-center gap-2">
-                      <span className="material-symbols-outlined text-base">delete</span> Delete
+                  {messageContextMenu.msg.senderId === currentUserId ? (
+                    <>
+                      <button onClick={() => handleDeleteForEveryone(messageContextMenu.msg)} className="w-full px-4 py-2 text-left text-[11px] font-bold text-vibrant-pink hover:bg-accent-red/20 flex items-center gap-2">
+                        <span className="material-symbols-outlined text-base">delete_forever</span> Delete for everyone
+                      </button>
+                      <button onClick={() => handleDeleteForMe(messageContextMenu.msg)} className="w-full px-4 py-2 text-left text-[11px] font-bold text-white hover:bg-accent-red/20 flex items-center gap-2">
+                        <span className="material-symbols-outlined text-base">delete</span> Delete for me
+                      </button>
+                    </>
+                  ) : (
+                    <button onClick={() => handleDeleteForMe(messageContextMenu.msg)} className="w-full px-4 py-2 text-left text-[11px] font-bold text-white hover:bg-accent-red/20 flex items-center gap-2">
+                      <span className="material-symbols-outlined text-base">delete</span> Delete for me
                     </button>
                   )}
                   <div className="border-t border-white/10 my-1" />
@@ -2314,7 +2614,50 @@ const App: React.FC = () => {
                             </div>
                           )}
                         </div>
-                        <p className="text-base font-bold text-white">{groupInfoData.name}</p>
+                        {groupNameEdit === groupInfoData.$id ? (
+                          <div className="flex items-center gap-2 w-full max-w-[220px] mt-1">
+                            <input
+                              type="text"
+                              value={groupNameEditValue}
+                              onChange={(e) => setGroupNameEditValue(e.target.value)}
+                              className="flex-1 bg-white/10 border border-accent-red/30 rounded-lg px-3 py-1.5 text-sm text-white font-bold focus:outline-none focus:ring-2 focus:ring-accent-red/50"
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') { e.preventDefault(); document.getElementById('group-name-save')?.click(); }
+                                if (e.key === 'Escape') { setGroupNameEdit(null); setGroupNameEditValue(''); }
+                              }}
+                              autoFocus
+                            />
+                            <button id="group-name-save" onClick={async () => {
+                              const val = groupNameEditValue.trim();
+                              if (!val || !currentUserId || !groupInfoData) return;
+                              try {
+                                await updateRoomName(groupInfoData.$id, currentUserId, val);
+                                setGroupInfoData(prev => prev ? { ...prev, name: val } : null);
+                                setActiveChat(prev => prev && prev.id === groupInfoData.$id ? { ...prev, name: val } : prev);
+                                setRooms(prev => prev.map(r => r.id === groupInfoData.$id ? { ...r, name: val } : r));
+                                setRecentChats(prev => prev.map(c => c.$id === groupInfoData.$id ? { ...c, name: val } : c));
+                              } catch (err: any) { window.alert(err?.message || 'Failed'); }
+                              setGroupNameEdit(null);
+                              setGroupNameEditValue('');
+                            }} className="px-3 py-1 bg-accent-red text-white text-[10px] font-bold rounded-lg">Save</button>
+                            <button onClick={() => { setGroupNameEdit(null); setGroupNameEditValue(''); }} className="px-3 py-1 bg-white/10 text-white text-[10px] font-bold rounded-lg">Cancel</button>
+                          </div>
+                        ) : (
+                          <div
+                            onClick={() => {
+                              if ((groupInfoData.participantIds || []).includes(currentUserId || '')) {
+                                setGroupNameEditValue(groupInfoData.name);
+                                setGroupNameEdit(groupInfoData.$id);
+                              }
+                            }}
+                            className={`${(groupInfoData.participantIds || []).includes(currentUserId || '') ? 'cursor-pointer group/edit' : ''}`}
+                          >
+                            <p className="text-base font-bold text-white">{groupInfoData.name}</p>
+                            {(groupInfoData.participantIds || []).includes(currentUserId || '') && (
+                              <span className="text-[9px] text-accent-red/70 opacity-0 group-hover/edit:opacity-100">Tap to edit</span>
+                            )}
+                          </div>
+                        )}
                         <p className="text-[10px] text-gray-500 uppercase tracking-wider mt-1">{groupInfoData.participantIds?.length || 0} participants</p>
                       </div>
                       <div className="py-4">
@@ -2489,6 +2832,10 @@ const App: React.FC = () => {
                 {recentChats.filter((c) => !c.isRoom).map((chat) => {
                   const otherId = chat.participantIds?.find((p) => p !== currentUserId) || chat.externalId || '';
                   const otherDisplayName = chat.participantData?.[otherId]?.displayName || chat.name || 'Unknown';
+                  const lastMsgId = (chat as any).lastMessageId;
+                  const deletedSet = messagesDeletedForMe[otherId];
+                  const isLastDeleted = lastMsgId && deletedSet?.has(lastMsgId);
+                  const previewText = chat.lastMessage ? (isLastDeleted ? 'Message deleted' : chat.lastMessage) : '';
                   const chatUser: User = {
                     id: otherId,
                     name: otherDisplayName.toUpperCase(),
@@ -2516,18 +2863,20 @@ const App: React.FC = () => {
                         </div>
                         <div className="flex-1 min-w-0">
                           <p className="text-[12px] font-bold text-white truncate">{otherDisplayName}</p>
-                          {chat.lastMessage && <p className="text-[9px] text-gray-500 truncate">{chat.lastMessage}</p>}
+                          {previewText && <p className={`text-[9px] truncate ${isLastDeleted ? 'text-gray-600 italic' : 'text-gray-500'}`}>{previewText}</p>}
                         </div>
                         <span className="material-symbols-outlined text-accent-red/60 text-lg shrink-0">chevron_right</span>
                       </div>
-                      <div className="flex gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
-                        <button type="button" onClick={() => startCall('audio', { id: otherId, name: otherDisplayName, avatar: getAvatarUrl(otherId), isRoom: false })} className="size-8 rounded-full bg-white/10 flex items-center justify-center text-accent-red hover:bg-accent-red hover:text-white transition-all" title="Voice call">
-                          <span className="material-symbols-outlined text-base">call</span>
-                        </button>
-                        <button type="button" onClick={() => startCall('video', { id: otherId, name: otherDisplayName, avatar: getAvatarUrl(otherId), isRoom: false })} className="size-8 rounded-full bg-accent-red/20 flex items-center justify-center text-accent-red hover:bg-accent-red hover:text-white transition-all" title="Video call">
-                          <span className="material-symbols-outlined text-base">videocam</span>
-                        </button>
-                      </div>
+                      {CALLS_ENABLED && (
+                        <div className="flex gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
+                          <button type="button" onClick={() => startCall('audio', { id: otherId, name: otherDisplayName, avatar: getAvatarUrl(otherId), isRoom: false })} className="size-8 rounded-full bg-white/10 flex items-center justify-center text-accent-red hover:bg-accent-red hover:text-white transition-all" title="Voice call">
+                            <span className="material-symbols-outlined text-base">call</span>
+                          </button>
+                          <button type="button" onClick={() => startCall('video', { id: otherId, name: otherDisplayName, avatar: getAvatarUrl(otherId), isRoom: false })} className="size-8 rounded-full bg-accent-red/20 flex items-center justify-center text-accent-red hover:bg-accent-red hover:text-white transition-all" title="Video call">
+                            <span className="material-symbols-outlined text-base">videocam</span>
+                          </button>
+                        </div>
+                      )}
                     </div>
                   );
                 })}
@@ -2543,6 +2892,10 @@ const App: React.FC = () => {
             {filteredRooms.map((room) => {
               const roomChat = recentChats.find((c) => c.isRoom && c.$id === room.id);
               const unread = roomChat ? ((roomChat as any).unreadCounts?.[currentUserId ?? ''] ?? 0) : 0;
+              const lastMsgId = roomChat ? (roomChat as any).lastMessageId : null;
+              const roomDeletedSet = messagesDeletedForMe[room.id];
+              const isRoomLastDeleted = lastMsgId && roomDeletedSet?.has(lastMsgId);
+              const roomPreview = room.lastMessage ? (isRoomLastDeleted ? 'Message deleted' : `${room.lastSender}: ${room.lastMessage}`) : '';
               return (
                 <div key={room.id} className="flex items-center gap-3 px-6 py-3.5 border-b border-white/5 hover:bg-white/5 group transition-colors relative">
                   <div
@@ -2559,17 +2912,19 @@ const App: React.FC = () => {
                     </div>
                     <div className="flex-1 min-w-0">
                       <div className="flex justify-between items-center"><p className="text-[12px] font-bold text-white truncate">{room.name}</p>{room.isLive && <span className="text-accent-red text-[8px] font-black animate-pulse">LIVE</span>}</div>
-                      <p className="text-[10px] text-gray-500 truncate mt-1"><span className="text-accent-red/70 font-bold">{room.lastSender}:</span> {room.lastMessage}</p>
+                      {roomPreview && <p className={`text-[10px] truncate mt-1 ${isRoomLastDeleted ? 'text-gray-600 italic' : 'text-gray-500'}`}>{isRoomLastDeleted ? roomPreview : <><span className="text-accent-red/70 font-bold">{room.lastSender}:</span> {room.lastMessage}</>}</p>}
                     </div>
                   </div>
-                  <div className="flex gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
-                    <button type="button" onClick={() => startCall('audio', { id: room.id, name: room.name, avatar: room.avatar, isRoom: true })} className="size-8 rounded-full bg-white/10 flex items-center justify-center text-accent-red hover:bg-accent-red hover:text-white transition-all" title="Voice call tribe">
-                      <span className="material-symbols-outlined text-base">call</span>
-                    </button>
-                    <button type="button" onClick={() => startCall('video', { id: room.id, name: room.name, avatar: room.avatar, isRoom: true })} className="size-8 rounded-full bg-accent-red/20 flex items-center justify-center text-accent-red hover:bg-accent-red hover:text-white transition-all" title="Video call tribe">
-                      <span className="material-symbols-outlined text-base">videocam</span>
-                    </button>
-                  </div>
+                  {CALLS_ENABLED && (
+                    <div className="flex gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
+                      <button type="button" onClick={() => startCall('audio', { id: room.id, name: room.name, avatar: room.avatar, isRoom: true })} className="size-8 rounded-full bg-white/10 flex items-center justify-center text-accent-red hover:bg-accent-red hover:text-white transition-all" title="Voice call tribe">
+                        <span className="material-symbols-outlined text-base">call</span>
+                      </button>
+                      <button type="button" onClick={() => startCall('video', { id: room.id, name: room.name, avatar: room.avatar, isRoom: true })} className="size-8 rounded-full bg-accent-red/20 flex items-center justify-center text-accent-red hover:bg-accent-red hover:text-white transition-all" title="Video call tribe">
+                        <span className="material-symbols-outlined text-base">videocam</span>
+                      </button>
+                    </div>
+                  )}
                 </div>
               );
             })}
@@ -2595,19 +2950,23 @@ const App: React.FC = () => {
                 <h3 className="text-xl font-party text-white tracking-widest neon-text mb-1 uppercase">{contact.name}</h3>
                 <p className="text-[10px] text-accent-red font-bold uppercase tracking-[0.2em] mb-6">Elite Bakchod Legend</p>
                 
-                <div className="grid grid-cols-3 gap-4 w-full">
-                  <button onClick={() => startCall('audio', { id: contact.contactId, name: contact.name, avatar: contact.contactId?.startsWith('r-') ? contact.avatar : getAvatarUrl(contact.contactId), isRoom: contact.isRoom ?? contact.contactId.startsWith('r-') })} className="flex flex-col items-center gap-2 group">
-                    <div className="size-12 rounded-2xl bg-white/5 border border-white/10 flex items-center justify-center text-accent-red group-hover:bg-accent-red group-hover:text-white transition-all shadow-lg active:scale-95">
-                      <span className="material-symbols-outlined">call</span>
-                    </div>
-                    <span className="text-[8px] font-bold text-gray-500 uppercase tracking-widest">Voice</span>
-                  </button>
-                  <button onClick={() => startCall('video', { id: contact.contactId, name: contact.name, avatar: contact.contactId?.startsWith('r-') ? contact.avatar : getAvatarUrl(contact.contactId), isRoom: contact.isRoom ?? contact.contactId.startsWith('r-') })} className="flex flex-col items-center gap-2 group">
-                    <div className="size-12 rounded-2xl bg-accent-red/10 border border-accent-red/20 flex items-center justify-center text-accent-red group-hover:bg-accent-red group-hover:text-white transition-all shadow-[0_0_15px_rgba(255,0,60,0.2)] active:scale-95">
-                      <span className="material-symbols-outlined">videocam</span>
-                    </div>
-                    <span className="text-[8px] font-bold text-gray-500 uppercase tracking-widest">Video</span>
-                  </button>
+                <div className={`grid gap-4 w-full ${CALLS_ENABLED ? 'grid-cols-3' : 'grid-cols-1 max-w-[140px] mx-auto'}`}>
+                  {CALLS_ENABLED && (
+                    <>
+                      <button onClick={() => startCall('audio', { id: contact.contactId, name: contact.name, avatar: contact.contactId?.startsWith('r-') ? contact.avatar : getAvatarUrl(contact.contactId), isRoom: contact.isRoom ?? contact.contactId.startsWith('r-') })} className="flex flex-col items-center gap-2 group">
+                        <div className="size-12 rounded-2xl bg-white/5 border border-white/10 flex items-center justify-center text-accent-red group-hover:bg-accent-red group-hover:text-white transition-all shadow-lg active:scale-95">
+                          <span className="material-symbols-outlined">call</span>
+                        </div>
+                        <span className="text-[8px] font-bold text-gray-500 uppercase tracking-widest">Voice</span>
+                      </button>
+                      <button onClick={() => startCall('video', { id: contact.contactId, name: contact.name, avatar: contact.contactId?.startsWith('r-') ? contact.avatar : getAvatarUrl(contact.contactId), isRoom: contact.isRoom ?? contact.contactId.startsWith('r-') })} className="flex flex-col items-center gap-2 group">
+                        <div className="size-12 rounded-2xl bg-accent-red/10 border border-accent-red/20 flex items-center justify-center text-accent-red group-hover:bg-accent-red group-hover:text-white transition-all shadow-[0_0_15px_rgba(255,0,60,0.2)] active:scale-95">
+                          <span className="material-symbols-outlined">videocam</span>
+                        </div>
+                        <span className="text-[8px] font-bold text-gray-500 uppercase tracking-widest">Video</span>
+                      </button>
+                    </>
+                  )}
                   <button
                     onClick={() => contact && addContactFromDetails(contact.contactId, contact.name, contact.contactId?.startsWith('r-') ? contact.avatar : getAvatarUrl(contact.contactId))}
                     disabled={!contact || contact.contactId.startsWith('r-') || isSavedContact}
@@ -2675,20 +3034,22 @@ const App: React.FC = () => {
                       <p className="text-[9px] text-gray-500 font-medium truncate uppercase tracking-tighter">{call.timestamp}</p>
                     </div>
                   </div>
-                  <div className="flex gap-2">
-                    <button 
-                      onClick={(e) => { e.stopPropagation(); startCall('audio', { id: call.contactId, name: call.name, avatar: call.avatar, isRoom: call.isRoom ?? call.contactId.startsWith('r-') }); }}
-                      className="size-9 rounded-full bg-white/5 flex items-center justify-center text-accent-red hover:bg-accent-red hover:text-white transition-all active:scale-90"
-                    >
-                      <span className="material-symbols-outlined text-base">call</span>
-                    </button>
-                    <button 
-                      onClick={(e) => { e.stopPropagation(); startCall('video', { id: call.contactId, name: call.name, avatar: call.avatar, isRoom: call.isRoom ?? call.contactId.startsWith('r-') }); }}
-                      className="size-9 rounded-full bg-accent-red/10 flex items-center justify-center text-accent-red hover:bg-accent-red hover:text-white transition-all active:scale-90"
-                    >
-                      <span className="material-symbols-outlined text-base">videocam</span>
-                    </button>
-                  </div>
+                  {CALLS_ENABLED && (
+                    <div className="flex gap-2">
+                      <button 
+                        onClick={(e) => { e.stopPropagation(); startCall('audio', { id: call.contactId, name: call.name, avatar: call.avatar, isRoom: call.isRoom ?? call.contactId.startsWith('r-') }); }}
+                        className="size-9 rounded-full bg-white/5 flex items-center justify-center text-accent-red hover:bg-accent-red hover:text-white transition-all active:scale-90"
+                      >
+                        <span className="material-symbols-outlined text-base">call</span>
+                      </button>
+                      <button 
+                        onClick={(e) => { e.stopPropagation(); startCall('video', { id: call.contactId, name: call.name, avatar: call.avatar, isRoom: call.isRoom ?? call.contactId.startsWith('r-') }); }}
+                        className="size-9 rounded-full bg-accent-red/10 flex items-center justify-center text-accent-red hover:bg-accent-red hover:text-white transition-all active:scale-90"
+                      >
+                        <span className="material-symbols-outlined text-base">videocam</span>
+                      </button>
+                    </div>
+                  )}
                 </div>
               ))
             )}
@@ -2933,23 +3294,17 @@ const App: React.FC = () => {
         </div>
       )}
 
-      {/* Mini Nav */}
-      <nav className="sticky bottom-0 left-0 right-0 h-20 bg-night-black border-t border-white/5 flex items-center justify-around px-8 pb-5 z-20 shadow-[0_-10px_30px_rgba(0,0,0,0.5)]">
-        <div onClick={() => {setActiveTab('party'); setActiveChat(null); setIsCalling(false); setIsCreatingGroup(false); setIsSettingsOpen(false); setActiveHistoryContactId(null);}} className={`flex flex-col items-center gap-1.5 cursor-pointer transition-all active:text-vibrant-pink ${activeTab === 'party' && !activeChat && !isCreatingGroup && !isSettingsOpen ? 'text-vibrant-pink scale-110 shadow-[0_0_15px_rgba(255,0,160,0.3)]' : 'text-accent-red hover:text-vibrant-pink/80'}`}>
-          <span className="material-symbols-outlined text-2xl font-bold">nightlife</span>
-          <span className="text-[10px] font-bold font-party uppercase tracking-tight">Party</span>
+      {/* Mini Nav - compact when chat open */}
+      <nav className={`sticky bottom-0 left-0 right-0 bg-night-black border-t border-white/5 flex items-center justify-center gap-12 z-20 shadow-[0_-10px_30px_rgba(0,0,0,0.5)] transition-all ${activeChat ? 'h-11 px-4 py-1.5' : 'h-20 px-8 pb-5'}`}>
+        <div onClick={() => {setActiveTab('party'); setActiveChat(null); setIsCalling(false); setIsCreatingGroup(false); setIsSettingsOpen(false); setActiveHistoryContactId(null);}} className={`flex flex-col items-center cursor-pointer transition-all active:text-vibrant-pink ${activeTab === 'party' && !activeChat && !isCreatingGroup && !isSettingsOpen ? 'text-vibrant-pink scale-110 shadow-[0_0_15px_rgba(255,0,160,0.3)]' : 'text-accent-red hover:text-vibrant-pink/80'} ${activeChat ? 'gap-0.5' : 'gap-1.5'}`} title="Party">
+          <span className={`material-symbols-outlined font-bold ${activeChat ? 'text-lg' : 'text-2xl'}`}>nightlife</span>
+          {!activeChat && <span className="text-[10px] font-bold font-party uppercase tracking-tight">Party</span>}
         </div>
-        <div onClick={() => {setActiveTab('hotline'); setActiveChat(null); setIsCalling(false); setIsCreatingGroup(false); setIsSettingsOpen(false); setActiveHistoryContactId(null);}} className={`flex flex-col items-center gap-1.5 cursor-pointer transition-all active:text-vibrant-pink ${activeTab === 'hotline' && !activeChat && !isCreatingGroup && !isSettingsOpen ? 'text-vibrant-pink scale-110 shadow-[0_0_15px_rgba(255,0,160,0.3)]' : 'text-accent-red hover:text-vibrant-pink/80'}`}>
-          <span className="material-symbols-outlined text-2xl font-bold">call</span>
-          <span className="text-[10px] font-bold font-party uppercase tracking-tight">Hotline</span>
-        </div>
-        <div onClick={() => {setActiveTab('bot'); setActiveChat(null); setIsCalling(false); setIsCreatingGroup(false); setIsSettingsOpen(false); setActiveHistoryContactId(null);}} className={`flex flex-col items-center gap-1.5 cursor-pointer transition-all active:text-vibrant-pink ${activeTab === 'bot' ? 'text-vibrant-pink scale-110 shadow-[0_0_15px_rgba(255,0,160,0.3)]' : 'text-accent-red hover:text-vibrant-pink/80'}`}>
-          <span className="material-symbols-outlined text-2xl font-bold">smart_toy</span>
-          <span className="text-[10px] font-bold font-party uppercase tracking-tight">Bot</span>
-        </div>
-        <div onClick={() => {setActiveTab('me'); setActiveChat(null); setIsCalling(false); setIsCreatingGroup(false); setIsSettingsOpen(true); setActiveHistoryContactId(null);}} className={`flex flex-col items-center gap-1.5 cursor-pointer group transition-all active:text-vibrant-pink ${activeTab === 'me' ? 'text-vibrant-pink scale-110 shadow-[0_0_15px_rgba(255,0,160,0.3)]' : 'text-accent-red'}`}>
-          <div className={`size-5.5 rounded-full border-2 bg-cover transition-all active:border-vibrant-pink ${activeTab === 'me' ? 'border-vibrant-pink shadow-sm' : 'border-accent-red group-hover:border-vibrant-pink/50'}`} style={{ backgroundImage: `url(${userAvatar})` }} />
-          <span className="text-[10px] font-bold font-party uppercase tracking-tight">Me</span>
+        <div onClick={() => {setActiveTab('me'); setActiveChat(null); setIsCalling(false); setIsCreatingGroup(false); setIsSettingsOpen(true); setActiveHistoryContactId(null);}} className={`flex flex-col items-center cursor-pointer group transition-all active:text-vibrant-pink ${activeTab === 'me' ? 'text-vibrant-pink scale-110 shadow-[0_0_15px_rgba(255,0,160,0.3)]' : 'text-accent-red'} ${activeChat ? 'gap-0.5' : 'gap-1.5'}`} title="Me">
+          <div className={`rounded-full border-2 overflow-hidden flex items-center justify-center shrink-0 transition-all active:border-vibrant-pink ${activeTab === 'me' ? 'border-vibrant-pink shadow-sm' : 'border-accent-red group-hover:border-vibrant-pink/50'} ${activeChat ? 'size-5' : 'size-6'}`}>
+            <img src={userAvatar || 'https://picsum.photos/seed/me/200'} alt="Me" className="w-full h-full object-cover" />
+          </div>
+          {!activeChat && <span className="text-[10px] font-bold font-party uppercase tracking-tight">Me</span>}
         </div>
       </nav>
     </Layout>

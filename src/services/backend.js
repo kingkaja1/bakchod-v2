@@ -14,6 +14,7 @@ import {
   setDoc,
   writeBatch,
   deleteDoc,
+  arrayUnion,
 } from 'firebase/firestore';
 import { signOut } from 'firebase/auth';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
@@ -225,6 +226,20 @@ export async function removeRoomMember(chatId, userId, memberIdToRemove) {
   return merged;
 }
 
+/** Update room name. Any participant can change the group name. */
+export async function updateRoomName(chatId, userId, newName) {
+  const chatRef = doc(db, 'chats', chatId);
+  const chatSnap = await getDoc(chatRef);
+  if (!chatSnap.exists()) throw new Error('Group not found');
+  const data = chatSnap.data();
+  const participantIds = data.participantIds || [];
+  if (!participantIds.includes(userId)) throw new Error('Only participants can change group name');
+  const name = String(newName || '').trim();
+  if (!name) throw new Error('Group name cannot be empty');
+  await updateDoc(chatRef, { name, updatedAt: serverTimestamp() });
+  return name;
+}
+
 /** Add or remove admin. Caller must be admin (or owner for demote). */
 export async function updateRoomAdmin(chatId, userId, targetUserId, makeAdmin) {
   const chatRef = doc(db, 'chats', chatId);
@@ -335,7 +350,7 @@ export async function createMessage(input) {
     userId: input.userId,
     role: input.role,
     content: input.content,
-    language: input.language,
+    language: input.language ?? null,
     type: input.type,
     imageUrl: input.imageUrl || null,
     audioUrl: input.audioUrl || null,
@@ -348,6 +363,7 @@ export async function createMessage(input) {
   batch.set(messageRef, msgData);
   const updateData = {
     lastMessage: input.content,
+    lastMessageId: messageRef.id,
     lastMessageAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
   };
@@ -355,12 +371,14 @@ export async function createMessage(input) {
     updateData.lastSender = input.userId;
     updateData.lastSenderDisplayName = input.lastSenderDisplayName;
   }
-  // Bump unread count for all participants except sender
-  participantIds.forEach((uid) => {
-    if (uid && uid !== input.userId) {
-      updateData[`unreadCounts.${uid}`] = (existingUnread[uid] ?? 0) + 1;
-    }
-  });
+  // Bump unread count for all participants except sender (skip for bot/roast messages)
+  if (input.role !== 'bot' && input.type !== 'roast') {
+    participantIds.forEach((uid) => {
+      if (uid && uid !== input.userId) {
+        updateData[`unreadCounts.${uid}`] = (existingUnread[uid] ?? 0) + 1;
+      }
+    });
+  }
   batch.update(chatRef, updateData);
   await batch.commit();
 }
@@ -374,13 +392,46 @@ export async function uploadChatFile(chatId, userId, file) {
   return getDownloadURL(storageRef);
 }
 
-/** Delete a single message. Only the sender or chat participants can delete. */
+/** Delete a single message from Firestore (delete for everyone). */
 export async function deleteMessage(chatId, messageId) {
   const msgRef = doc(db, 'chats', chatId, 'messages', messageId);
   await deleteDoc(msgRef);
 }
 
-/** Clear all messages in a chat. Leaves the chat doc intact. */
+/** Clear chat for current user only. Messages remain for others. */
+export async function setChatClearedForMe(chatId, userId) {
+  const ref = doc(db, 'chats', chatId, 'userSettings', userId);
+  await setDoc(ref, { clearedAt: serverTimestamp() }, { merge: true });
+}
+
+/** Get when user last cleared this chat. */
+export async function getChatClearedAt(chatId, userId) {
+  const ref = doc(db, 'chats', chatId, 'userSettings', userId);
+  const snap = await getDoc(ref);
+  if (!snap.exists()) return null;
+  const data = snap.data();
+  const t = data?.clearedAt;
+  if (!t) return null;
+  if (typeof t?.toDate === 'function') return t.toDate().getTime();
+  if (typeof t?.seconds === 'number') return t.seconds * 1000;
+  return null;
+}
+
+/** Add message to user's "deleted for me" list. Message stays for others. */
+export async function addMessageDeletedForMe(chatId, userId, messageId) {
+  const ref = doc(db, 'chats', chatId, 'userDeletedMessages', userId);
+  await setDoc(ref, { messageIds: arrayUnion(messageId) }, { merge: true });
+}
+
+/** Get message IDs user has deleted for me in this chat. */
+export async function getMessagesDeletedForMe(chatId, userId) {
+  const ref = doc(db, 'chats', chatId, 'userDeletedMessages', userId);
+  const snap = await getDoc(ref);
+  if (!snap.exists()) return [];
+  return snap.data()?.messageIds || [];
+}
+
+/** Clear all messages in a chat for everyone. Leaves the chat doc intact. */
 export async function clearChat(chatId) {
   const messagesRef = collection(db, 'chats', chatId, 'messages');
   const snapshot = await getDocs(query(messagesRef, limit(500)));
@@ -443,6 +494,21 @@ export async function getChatMute(userId, chatId) {
 export async function setChatMute(userId, chatId, muted) {
   const ref = doc(db, 'users', userId, 'chatSettings', chatId);
   await setDoc(ref, { muted: !!muted, updatedAt: serverTimestamp() }, { merge: true });
+}
+
+/** Get roasts enabled for a chat (per-user). Defaults to true if not set. */
+export async function getChatRoastsEnabled(userId, chatId) {
+  const ref = doc(db, 'users', userId, 'chatSettings', chatId);
+  const snap = await getDoc(ref);
+  if (!snap.exists()) return true;
+  const data = snap.data();
+  return data.roastsEnabled !== false;
+}
+
+/** Set roasts enabled for a chat (per-user). */
+export async function setChatRoastsEnabled(userId, chatId, enabled) {
+  const ref = doc(db, 'users', userId, 'chatSettings', chatId);
+  await setDoc(ref, { roastsEnabled: !!enabled, updatedAt: serverTimestamp() }, { merge: true });
 }
 
 export async function addMessageReaction(chatId, messageId, userId, emoji) {
