@@ -54,7 +54,7 @@ import {
 } from './services/backend';
 import { User, ActiveRoom, Message } from './types';
 import { registerForPushNotifications, isPushSupported } from './services/pushNotifications';
-import { playMessageNotificationSound, playVibeCelebrationSound, unlockAudioOnFirstInteraction } from './services/messageNotificationSound';
+import { playMessageNotificationSound, playSendSound, playReceiveSound, playVibeCelebrationSound, unlockAudioOnFirstInteraction, getSendSound, getReceiveSound, setSendSound, setReceiveSound, type MessageSoundOption } from './services/messageNotificationSound';
 import confetti from 'canvas-confetti';
 import EmojiPicker, { Theme } from 'emoji-picker-react';
 import JitsiCallView from './components/JitsiCallView';
@@ -275,6 +275,7 @@ const App: React.FC = () => {
   const [activeChat, setActiveChat] = useState<{ id: string; name: string; avatar: string; isRoom: boolean } | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [activeSettingCategory, setActiveSettingCategory] = useState<string | null>(null);
+  const [soundSettingsVersion, setSoundSettingsVersion] = useState(0);
   const [activeHistoryContactId, setActiveHistoryContactId] = useState<string | null>(null);
   const [isInviteOpen, setIsInviteOpen] = useState(false);
   const [inviteTargetType, setInviteTargetType] = useState<'userId' | 'phone'>('userId');
@@ -385,8 +386,11 @@ const App: React.FC = () => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const chatAttachRef = useRef<HTMLInputElement>(null);
+  const chatAttachGalleryRef = useRef<HTMLInputElement>(null);
+  const chatAttachCameraPhotoRef = useRef<HTMLInputElement>(null);
+  const chatAttachDocRef = useRef<HTMLInputElement>(null);
   const [isUploadingMedia, setIsUploadingMedia] = useState(false);
+  const [showAttachMenu, setShowAttachMenu] = useState(false);
   const [isRecordingVoice, setIsRecordingVoice] = useState(false);
   const [stream, setStream] = useState<MediaStream | null>(null);
   const activeChatUnsubscribeRef = useRef<null | (() => void)>(null);
@@ -977,7 +981,7 @@ const App: React.FC = () => {
       });
       const hasNewFromOther = newFromOther.length > 0;
       if (!isInitialLoad && hasNewFromOther && !mutedChatsRef.current[chatId]) {
-        playMessageNotificationSound();
+        playReceiveSound();
       }
       if (!isInitialLoad && hasNewFromOther) {
         const vibeMatches = newFromOther.filter((d: any) =>
@@ -1116,6 +1120,25 @@ const App: React.FC = () => {
     return () => { clearTimeout(t); };
   }, [celebrationEffect]);
 
+  const handleChatAttachFile = async (file: File) => {
+    if (!file || !activeChat || !currentUserId) return;
+    const firestoreChatId = chatDocIds[activeChat.id] ?? (await getOrCreateChat({ userId: currentUserId, externalId: activeChat.id, name: activeChat.name, isRoom: activeChat.isRoom, currentUserDisplayName: displayName })).$id;
+    if (!chatDocIds[activeChat.id]) setChatDocIds(prev => ({ ...prev, [activeChat.id]: firestoreChatId }));
+    setIsUploadingMedia(true);
+    setShowAttachMenu(false);
+    try {
+      const url = await uploadChatFile(firestoreChatId, currentUserId, file);
+      const isImage = (file.type || '').startsWith('image/');
+      const isVideo = (file.type || '').startsWith('video/');
+      const kind: 'image' | 'video' | 'file' = isImage ? 'image' : isVideo ? 'video' : 'file';
+      await handleSendMessage(kind === 'file' ? file.name : '', kind, { imageUrl: url, fileName: file.name });
+    } catch (err: any) {
+      window.alert(err?.message || 'Upload failed.');
+    } finally {
+      setIsUploadingMedia(false);
+    }
+  };
+
   const handleSendMessage = async (text: string, type: 'text' | 'image' | 'video' | 'file' | 'audio' | 'roast' = 'text', options?: { imageUrl?: string; fileName?: string; audioUrl?: string }) => {
     const mediaUrl = options?.imageUrl ?? options?.audioUrl;
     const hasContent = (text && text.trim()) || mediaUrl;
@@ -1200,6 +1223,7 @@ const App: React.FC = () => {
           replyTo: replyToMessage ? { messageId: replyToMessage.id, text: replyToMessage.text.slice(0, 100), senderName: replyToMessage.senderName } : undefined,
         });
         setReplyToMessage(null);
+        playSendSound();
         if (activeChat && chatDocIds[activeChat.id]) {
           void setTyping(chatDocIds[activeChat.id], currentUserId!, displayName || 'You', false);
         }
@@ -1887,6 +1911,62 @@ const App: React.FC = () => {
           </div>
         );
       }
+      if (activeSettingCategory === 'Notifications') {
+        const soundOptions: { value: MessageSoundOption; label: string }[] = [
+          { value: 'duck', label: 'Duck (default)' },
+          { value: 'classic', label: 'Classic chime' },
+          { value: 'none', label: 'None' },
+        ];
+        return (
+          <div className="flex-1 flex flex-col bg-night-black animate-in slide-in-from-right duration-300 h-full relative">
+            <div className="flex items-center gap-4 p-4 border-b border-white/5 bg-night-panel/50">
+              <button onClick={() => setActiveSettingCategory(null)} className="text-accent-red p-1 rounded-full hover:bg-accent-red/10">
+                <span className="material-symbols-outlined">arrow_back</span>
+              </button>
+              <h2 className="text-sm font-party text-white uppercase tracking-widest">Hulla Gulla</h2>
+            </div>
+            <div className="p-6 space-y-6 overflow-y-auto no-scrollbar">
+              <div className="p-4 bg-white/5 rounded-2xl border border-white/10 space-y-3">
+                <p className="text-[10px] text-accent-red font-bold uppercase tracking-[0.2em]">Message send sound</p>
+                <div className="flex flex-wrap gap-2">
+                  {soundOptions.map((opt) => (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      onClick={() => { setSendSound(opt.value); setSoundSettingsVersion((v) => v + 1); }}
+                      className={`px-4 py-2 rounded-xl text-[11px] font-bold transition-all ${getSendSound() === opt.value ? 'bg-accent-red text-white' : 'bg-white/10 text-white/80 hover:bg-white/15'}`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+                <button type="button" onClick={() => playSendSound()} className="flex items-center gap-2 text-[10px] text-accent-red font-bold uppercase tracking-widest">
+                  <span className="material-symbols-outlined text-sm">play_circle</span> Preview send sound
+                </button>
+              </div>
+              <div className="p-4 bg-white/5 rounded-2xl border border-white/10 space-y-3">
+                <p className="text-[10px] text-accent-red font-bold uppercase tracking-[0.2em]">Message receive sound</p>
+                <div className="flex flex-wrap gap-2">
+                  {soundOptions.map((opt) => (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      onClick={() => { setReceiveSound(opt.value); setSoundSettingsVersion((v) => v + 1); }}
+                      className={`px-4 py-2 rounded-xl text-[11px] font-bold transition-all ${getReceiveSound() === opt.value ? 'bg-accent-red text-white' : 'bg-white/10 text-white/80 hover:bg-white/15'}`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+                <button type="button" onClick={() => playReceiveSound()} className="flex items-center gap-2 text-[10px] text-accent-red font-bold uppercase tracking-widest">
+                  <span className="material-symbols-outlined text-sm">play_circle</span> Preview receive sound
+                </button>
+              </div>
+              <p className="text-[10px] text-gray-500">Duck plays when you send or receive a message. Choose Classic for the two-tone chime, or None to silence.</p>
+            </div>
+          </div>
+        );
+      }
       return (
         <div className="flex-1 flex flex-col bg-night-black animate-in slide-in-from-right duration-300 h-full relative">
           <div className="flex items-center gap-4 p-4 border-b border-white/5 bg-night-panel/50">
@@ -2418,7 +2498,7 @@ const App: React.FC = () => {
             </div>
           </div>
 
-          <div className="p-3 bg-night-black border-t border-accent-red/30 space-y-2">
+          <div className="relative p-3 bg-night-black border-t border-accent-red/30 space-y-2">
             {replyToMessage && (
               <div className="flex items-center justify-between bg-accent-red/10 border border-accent-red/30 rounded-xl px-3 py-2">
                 <div className="flex-1 min-w-0">
@@ -2448,30 +2528,35 @@ const App: React.FC = () => {
                 </div>
               </div>
             )}
-            <input ref={chatAttachRef} type="file" accept="image/*,video/*,*/*" className="hidden" onChange={async (e) => {
-              const file = e.target.files?.[0];
-              e.target.value = '';
-              if (!file || !activeChat || !currentUserId) return;
-              const firestoreChatId = chatDocIds[activeChat.id] ?? (await getOrCreateChat({ userId: currentUserId, externalId: activeChat.id, name: activeChat.name, isRoom: activeChat.isRoom, currentUserDisplayName: displayName })).$id;
-              if (!chatDocIds[activeChat.id]) setChatDocIds(prev => ({ ...prev, [activeChat.id]: firestoreChatId }));
-              setIsUploadingMedia(true);
-              try {
-                const url = await uploadChatFile(firestoreChatId, currentUserId, file);
-                const isImage = (file.type || '').startsWith('image/');
-                const isVideo = (file.type || '').startsWith('video/');
-                const kind: 'image' | 'video' | 'file' = isImage ? 'image' : isVideo ? 'video' : 'file';
-                await handleSendMessage(kind === 'file' ? file.name : '', kind, { imageUrl: url, fileName: file.name });
-              } catch (err: any) {
-                window.alert(err?.message || 'Upload failed.');
-              } finally {
-                setIsUploadingMedia(false);
-              }
-            }} />
+            {/* Hidden file inputs for WhatsApp-style attach */}
+            <input ref={chatAttachGalleryRef} type="file" accept="image/*" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ''; if (f) handleChatAttachFile(f); }} />
+            <input ref={chatAttachCameraPhotoRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ''; if (f) handleChatAttachFile(f); }} />
+            <input ref={chatAttachDocRef} type="file" accept="*/*" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ''; if (f) handleChatAttachFile(f); }} />
+            {showAttachMenu && (
+              <div className="absolute bottom-full left-0 right-0 mb-1 p-2 bg-night-panel border-2 border-accent-red rounded-xl shadow-[0_0_20px_rgba(255,0,60,0.3)]">
+                <p className="text-[10px] font-party text-accent-red uppercase tracking-widest mb-2">Share</p>
+                <div className="grid grid-cols-2 gap-2">
+                  <button type="button" onClick={() => { chatAttachGalleryRef.current?.click(); setShowAttachMenu(false); }} className="flex flex-col items-center gap-1 p-3 rounded-xl bg-white/5 border border-white/10 hover:bg-accent-red/20 hover:border-accent-red/50 transition-all active:scale-95">
+                    <span className="material-symbols-outlined text-2xl text-accent-red">photo_library</span>
+                    <span className="text-[9px] font-bold text-white">Photo</span>
+                  </button>
+                  <button type="button" onClick={() => { chatAttachCameraPhotoRef.current?.click(); setShowAttachMenu(false); }} className="flex flex-col items-center gap-1 p-3 rounded-xl bg-white/5 border border-white/10 hover:bg-accent-red/20 hover:border-accent-red/50 transition-all active:scale-95">
+                    <span className="material-symbols-outlined text-2xl text-accent-red">camera_alt</span>
+                    <span className="text-[9px] font-bold text-white">Camera</span>
+                  </button>
+                  <button type="button" onClick={() => { chatAttachDocRef.current?.click(); setShowAttachMenu(false); }} className="flex flex-col items-center gap-1 p-3 rounded-xl bg-white/5 border border-white/10 hover:bg-accent-red/20 hover:border-accent-red/50 transition-all active:scale-95">
+                    <span className="material-symbols-outlined text-2xl text-accent-red">description</span>
+                    <span className="text-[9px] font-bold text-white">Document</span>
+                  </button>
+                </div>
+                <button type="button" onClick={() => setShowAttachMenu(false)} className="mt-2 w-full py-1 text-[9px] text-accent-red font-bold uppercase tracking-widest">Cancel</button>
+              </div>
+            )}
             <form onSubmit={(e) => { e.preventDefault(); if (chatInput.trim()) { handleSendMessage(chatInput); setChatInput(""); } }} className="flex items-center gap-2 bg-accent-red/5 border-2 border-accent-red rounded-xl px-3 h-11 group focus-within:ring-2 focus:ring-accent-red/30 transition-all">
-              <button type="button" onClick={() => { setShowEmojiPicker(!showEmojiPicker); setShowVibePicker(false); }} className={`text-accent-red/60 hover:text-accent-red transition-colors ${showEmojiPicker ? 'text-accent-red' : ''}`}>
+              <button type="button" onClick={() => { setShowEmojiPicker(!showEmojiPicker); setShowVibePicker(false); setShowAttachMenu(false); }} className={`text-accent-red/60 hover:text-accent-red transition-colors ${showEmojiPicker ? 'text-accent-red' : ''}`}>
                 <span className="material-symbols-outlined text-xl">mood</span>
               </button>
-              <button type="button" onClick={() => chatAttachRef.current?.click()} disabled={isUploadingMedia} className="text-accent-red/60 hover:text-accent-red disabled:opacity-50 transition-colors" title="Attach photo, video or file">
+              <button type="button" onClick={() => { setShowAttachMenu(!showAttachMenu); setShowEmojiPicker(false); setShowVibePicker(false); }} disabled={!activeChat || isUploadingMedia} className={`text-accent-red/60 hover:text-accent-red disabled:opacity-50 transition-colors ${showAttachMenu ? 'text-accent-red' : ''}`} title="Attach photo or file">
                 <span className="material-symbols-outlined text-xl">{isUploadingMedia ? 'hourglass_empty' : 'attach_file'}</span>
               </button>
               <button type="button" onClick={toggleVoiceRecording} disabled={isUploadingMedia} className={`transition-colors ${isRecordingVoice ? 'text-accent-red animate-pulse' : 'text-accent-red/60 hover:text-accent-red'} disabled:opacity-50`} title={isRecordingVoice ? 'Stop and send' : 'Voice message'}>

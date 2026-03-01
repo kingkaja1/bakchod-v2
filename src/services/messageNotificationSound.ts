@@ -90,3 +90,71 @@ export function playVibeCelebrationSound(): void {
     // Ignore
   }
 }
+
+// --- Message send/receive sound preferences (default: duck) ---
+const SEND_SOUND_KEY = 'bakchod_sendSound';
+const RECEIVE_SOUND_KEY = 'bakchod_receiveSound';
+export type MessageSoundOption = 'duck' | 'classic' | 'none';
+
+export function getSendSound(): MessageSoundOption {
+  if (typeof window === 'undefined') return 'duck';
+  const v = window.localStorage.getItem(SEND_SOUND_KEY);
+  return (v === 'duck' || v === 'classic' || v === 'none') ? v : 'duck';
+}
+
+export function getReceiveSound(): MessageSoundOption {
+  if (typeof window === 'undefined') return 'duck';
+  const v = window.localStorage.getItem(RECEIVE_SOUND_KEY);
+  return (v === 'duck' || v === 'classic' || v === 'none') ? v : 'duck';
+}
+
+export function setSendSound(value: MessageSoundOption): void {
+  if (typeof window === 'undefined') return;
+  window.localStorage.setItem(SEND_SOUND_KEY, value);
+}
+
+export function setReceiveSound(value: MessageSoundOption): void {
+  if (typeof window === 'undefined') return;
+  window.localStorage.setItem(RECEIVE_SOUND_KEY, value);
+}
+
+/** Duck-style "quack" sound: short descending tone + noise burst. */
+export function playDuckSound(): void {
+  if (typeof window === 'undefined') return;
+  const ctx = getAudioContext();
+  if (!ctx) return;
+  if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+  try {
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(620, now);
+    osc.frequency.exponentialRampToValueAtTime(380, now + 0.08);
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(0.2, now + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.12);
+    osc.start(now);
+    osc.stop(now + 0.14);
+  } catch {
+    // Ignore
+  }
+}
+
+/** Play the configured send sound (duck by default). */
+export function playSendSound(): void {
+  const opt = getSendSound();
+  if (opt === 'none') return;
+  if (opt === 'duck') playDuckSound();
+  else playMessageNotificationSound();
+}
+
+/** Play the configured receive sound (duck by default). */
+export function playReceiveSound(): void {
+  const opt = getReceiveSound();
+  if (opt === 'none') return;
+  if (opt === 'duck') playDuckSound();
+  else playMessageNotificationSound();
+}
